@@ -275,7 +275,8 @@ MAIN_FUNCTION
     assert(node_init);
     assert(mining);
 
-    auto tp = std::make_unique<Sv2TemplateProvider>(*mining);
+    auto tp = std::make_unique<Sv2TemplateProvider>();
+    tp->ReplaceBackend(std::move(node_init), std::move(mining));
 
     if (!tp->Start(options)) {
         tfm::format(std::cerr, "Unable to start Stratum v2 Template Provider");
@@ -290,47 +291,25 @@ MAIN_FUNCTION
     registerSignalHandler(SIGINT, HandleSIGTERM);
 #endif
 
-    while (!g_interrupt && !tp->BackendDisconnected()) {
-        UninterruptibleSleep(100ms);
-    }
-
     while (!g_interrupt) {
-        LogPrintf("Restarting sv2-tp after Bitcoin Core IPC disconnect\n");
-        const bool backend_disconnected = tp->BackendDisconnected();
-        tp->Interrupt();
-        tp->StopThreads();
-        tp.reset();
-        if (backend_disconnected) {
-            mining.release();
-            node_init.release();
-        } else {
-            mining.reset();
-            node_init.reset();
+        if (!tp->BackendDisconnected()) {
+            UninterruptibleSleep(100ms);
+            continue;
         }
 
+        LogPrintf("Restarting sv2-tp after Bitcoin Core IPC disconnect\n");
         connection = connect_to_node();
         node_init = std::move(connection.first);
         mining = std::move(connection.second);
         if (g_interrupt) break;
         assert(node_init);
         assert(mining);
-
-        tp = std::make_unique<Sv2TemplateProvider>(*mining);
-        if (!tp->Start(options)) {
-            tfm::format(std::cerr, "Unable to start Stratum v2 Template Provider");
-            return EXIT_FAILURE;
-        }
-
-        while (!g_interrupt && !tp->BackendDisconnected()) {
-            UninterruptibleSleep(100ms);
-        }
+        tp->ReplaceBackend(std::move(node_init), std::move(mining));
     }
 
-    if (tp) {
-        tp->Interrupt();
-        tp->StopThreads();
-        tp.reset();
-    }
+    tp->Interrupt();
+    tp->StopThreads();
+    tp.reset();
 
     return EXIT_SUCCESS;
 }

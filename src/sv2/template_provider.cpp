@@ -21,18 +21,68 @@
 constexpr size_t STALE_TEMPLATE_GRACE_PERIOD{10};
 
 template <typename T>
-std::shared_ptr<T> MakeSharedIpcProxy(std::unique_ptr<T> proxy, const std::atomic<bool>& disconnected)
+std::shared_ptr<T> MakeSharedIpcProxy(std::unique_ptr<T> proxy,
+                                      const std::shared_ptr<std::atomic<bool>>& disconnected)
 {
-    return std::shared_ptr<T>(proxy.release(), [&disconnected](T* ptr) {
+    return std::shared_ptr<T>(proxy.release(), [disconnected](T* ptr) {
         if (!ptr) return;
-        if (disconnected.load()) return;
+        if (disconnected->load()) return;
         delete ptr;
     });
 }
 
-void Sv2TemplateProvider::DisconnectBackend(const char* operation, const std::exception& exception)
+Sv2TemplateProvider::BackendSession::BackendSession(std::unique_ptr<interfaces::Init> init,
+                                                    std::unique_ptr<interfaces::Mining> mining) :
+    m_init(init.release(), IpcProxyDeleter<interfaces::Init>{m_disconnected}),
+    m_mining(mining.release(), IpcProxyDeleter<interfaces::Mining>{m_disconnected})
 {
-    const bool first_disconnect = !m_backend_disconnected.exchange(true);
+}
+
+void Sv2TemplateProvider::ReplaceBackend(std::unique_ptr<interfaces::Init> node_init,
+                                         std::unique_ptr<interfaces::Mining> mining)
+{
+    auto backend = std::make_shared<BackendSession>(std::move(node_init), std::move(mining));
+    {
+        LOCK(m_backend_mutex);
+        m_backend = backend;
+    }
+    m_backend_disconnected = false;
+    {
+        LOCK(m_tp_mutex);
+        ClearTemplateCache();
+    }
+    m_backend_cv.notify_all();
+}
+
+std::shared_ptr<Sv2TemplateProvider::BackendSession> Sv2TemplateProvider::WaitForBackend()
+{
+    WAIT_LOCK(m_backend_mutex, lock);
+    m_backend_cv.wait(lock, [this] { return m_flag_interrupt_sv2 || m_backend; });
+    if (m_flag_interrupt_sv2) return nullptr;
+    return m_backend;
+}
+
+void Sv2TemplateProvider::DisconnectBackend(const std::shared_ptr<BackendSession>& backend,
+                                            const char* operation,
+                                            const std::exception& exception)
+{
+    if (!backend) return;
+    const bool first_disconnect = backend->MarkDisconnected();
+    std::shared_ptr<BackendSession> active_backend;
+    {
+        LOCK(m_backend_mutex);
+        if (m_backend == backend) {
+            active_backend = m_backend;
+            m_backend.reset();
+        }
+    }
+    if (!active_backend) return;
+
+    m_backend_disconnected = true;
+    {
+        LOCK(m_tp_mutex);
+        ClearTemplateCache();
+    }
     if (first_disconnect) {
         LogPrintLevel(BCLog::SV2, BCLog::Level::Error,
                       "Bitcoin Core IPC connection lost during %s: %s\n",
@@ -43,30 +93,36 @@ void Sv2TemplateProvider::DisconnectBackend(const char* operation, const std::ex
                       operation, exception.what());
     }
 
-    m_flag_interrupt_sv2 = true;
-    if (m_connman) m_connman->Interrupt();
+    m_backend_cv.notify_all();
 }
 
-void Sv2TemplateProvider::InterruptMining()
+void Sv2TemplateProvider::InterruptBackend()
 {
+    std::shared_ptr<BackendSession> backend;
+    {
+        LOCK(m_backend_mutex);
+        backend = m_backend;
+    }
+    if (!backend) return;
+
     {
         LOCK(m_tp_mutex);
         for (auto& t : GetBlockTemplates()) {
             try {
                 t.second.second->interruptWait();
             } catch (const ipc::Exception& e) {
-                DisconnectBackend("interruptWait", e);
+                DisconnectBackend(backend, "interruptWait", e);
             }
         }
     }
     try {
-        m_mining.interrupt();
+        backend->Mining().interrupt();
     } catch (const ipc::Exception& e) {
-        DisconnectBackend("interrupt", e);
+        DisconnectBackend(backend, "interrupt", e);
     }
 }
 
-Sv2TemplateProvider::Sv2TemplateProvider(interfaces::Mining& mining) : m_mining{mining}
+Sv2TemplateProvider::Sv2TemplateProvider()
 {
     // TODO: persist static key
     CKey static_key;
@@ -163,6 +219,19 @@ Sv2TemplateProvider::~Sv2TemplateProvider()
 {
     AssertLockNotHeld(m_tp_mutex);
 
+    {
+        LOCK(m_backend_mutex);
+        if (m_backend) {
+            m_backend->MarkDisconnected();
+            m_backend.reset();
+        }
+    }
+    {
+        LOCK(m_tp_mutex);
+        ClearTemplateCache();
+    }
+    m_backend_cv.notify_all();
+
     m_connman->Interrupt();
     m_connman->StopThreads();
 
@@ -176,7 +245,8 @@ void Sv2TemplateProvider::Interrupt()
 
     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Interrupt pending mining waits...");
     m_flag_interrupt_sv2 = true;
-    InterruptMining();
+    m_backend_cv.notify_all();
+    InterruptBackend();
     // Also interrupt network threads so client handlers can wind down quickly.
     if (m_connman) m_connman->Interrupt();
 }
@@ -213,56 +283,64 @@ public:
     }
 };
 
+void Sv2TemplateProvider::ClearTemplateCache()
+{
+    AssertLockHeld(m_tp_mutex);
+    m_block_template_cache.clear();
+    m_best_prev_hash = uint256::ZERO;
+    m_last_block_time = GetTime<std::chrono::seconds>();
+}
+
 void Sv2TemplateProvider::ThreadSv2Handler()
 {
-    try {
-        // Make sure it's initialized, doesn't need to be accurate.
+    {
+        LOCK(m_tp_mutex);
+        m_last_block_time = GetTime<std::chrono::seconds>();
+    }
+
+    std::map<size_t, std::thread> client_threads;
+
+    while (!m_flag_interrupt_sv2) {
+        std::shared_ptr<BackendSession> backend;
         {
-            LOCK(m_tp_mutex);
-            m_last_block_time = GetTime<std::chrono::seconds>();
+            LOCK(m_backend_mutex);
+            backend = m_backend;
         }
 
-        // Wait to come out of IBD, except on signet, where we might be the only miner.
-        size_t log_ibd{0};
-        while (!m_flag_interrupt_sv2 && gArgs.GetChainType() != ChainType::SIGNET) {
-            if (!m_mining.isInitialBlockDownload()) break;
-            if (log_ibd == 0) {
-                LogPrintf("Waiting for IBD to complete on %s network before serving templates (this may take a while)\n",
-                          ChainTypeToString(gArgs.GetChainType()));
-            } else if (log_ibd % 10 == 0) {
-                LogPrintf(".\n");
-            }
-            log_ibd++;
-            std::this_thread::sleep_for(1000ms);
-        }
-
-        std::map<size_t, std::thread> client_threads;
-
-        while (!m_flag_interrupt_sv2) {
-            m_connman->ForEachClient([this, &client_threads](Sv2Client& client) {
-                if (!client.m_coinbase_output_constraints_recv) return;
-
-                if (client_threads.contains(client.m_id)) return;
-
-                client_threads.emplace(client.m_id,
-                                       std::thread(&util::TraceThread,
-                                                   strprintf("sv2-%zu", client.m_id),
-                                                   [this, &client] { ThreadSv2ClientHandler(client.m_id); }));
-            });
-
-            std::this_thread::sleep_for(100ms);
-
-            LOCK(m_tp_mutex);
-            PruneBlockTemplateCache();
-        }
-
-        for (auto& thread : client_threads) {
-            if (thread.second.joinable()) {
-                thread.second.join();
+        if (backend && gArgs.GetChainType() != ChainType::SIGNET) {
+            try {
+                if (backend->Mining().isInitialBlockDownload()) {
+                    std::this_thread::sleep_for(1000ms);
+                    continue;
+                }
+            } catch (const ipc::Exception& e) {
+                DisconnectBackend(backend, "template provider main loop", e);
+                continue;
             }
         }
-    } catch (const ipc::Exception& e) {
-        DisconnectBackend("template provider main loop", e);
+
+        m_connman->ForEachClient([this, &client_threads](Sv2Client& client) {
+            if (!client.m_coinbase_output_constraints_recv) return;
+
+            if (client_threads.contains(client.m_id)) return;
+
+            const size_t client_id = client.m_id;
+            client_threads.emplace(client_id,
+                                   std::thread(&util::TraceThread,
+                                               strprintf("sv2-%zu", client_id),
+                                               [this, client_id] { ThreadSv2ClientHandler(client_id); }));
+        });
+
+        std::this_thread::sleep_for(100ms);
+
+        LOCK(m_tp_mutex);
+        PruneBlockTemplateCache();
+    }
+
+    for (auto& thread : client_threads) {
+        if (thread.second.joinable()) {
+            thread.second.join();
+        }
     }
 }
 
@@ -295,9 +373,28 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
         };
 
         std::shared_ptr<BlockTemplate> block_template;
+        std::shared_ptr<BackendSession> backend;
+        std::shared_ptr<BackendSession> template_backend;
         // Cache most recent block_template->getBlockHeader().hashPrevBlock result.
         uint256 prev_hash;
         while (!m_flag_interrupt_sv2) {
+            if (!backend) {
+                backend = WaitForBackend();
+                if (!backend) break;
+            }
+
+            if (backend->Disconnected()) {
+                backend.reset();
+                block_template.reset();
+                template_backend.reset();
+                continue;
+            }
+
+            if (template_backend && template_backend != backend) {
+                block_template.reset();
+                template_backend.reset();
+            }
+
             if (!block_template) {
                 LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Generate initial block template for client id=%zu\n",
                             client_id);
@@ -310,13 +407,20 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 if (!prepare_block_create_options(block_create_options)) break;
 
                 const auto time_start{SteadyClock::now()};
-                block_template = MakeSharedIpcProxy(m_mining.createNewBlock(block_create_options),
-                                                   m_backend_disconnected);
+                try {
+                    block_template = MakeSharedIpcProxy(backend->Mining().createNewBlock(block_create_options),
+                                                        backend->DisconnectState());
+                } catch (const ipc::Exception& e) {
+                    DisconnectBackend(backend, "createNewBlock", e);
+                    backend.reset();
+                    continue;
+                }
                 if (!block_template) {
                     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "No new template for client id=%zu, node is shutting down\n",
                         client_id);
                     break;
                 }
+                template_backend = backend;
 
                 LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Assemble template: %.2fms\n",
                     Ticks<MillisecondsDouble>(SteadyClock::now() - time_start));
@@ -378,8 +482,16 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                               client_id);
             }
 
-            std::shared_ptr<BlockTemplate> tmpl = MakeSharedIpcProxy(block_template->waitNext(options),
-                                                                    m_backend_disconnected);
+            std::shared_ptr<BlockTemplate> tmpl;
+            try {
+                tmpl = MakeSharedIpcProxy(block_template->waitNext(options), template_backend->DisconnectState());
+            } catch (const ipc::Exception& e) {
+                DisconnectBackend(template_backend, "template provider client loop", e);
+                backend.reset();
+                block_template.reset();
+                template_backend.reset();
+                continue;
+            }
             // The client may have disconnected during the wait, check now to avoid
             // a spurious IPC call and confusing log statements.
             {
@@ -390,6 +502,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
             // After timeout and during node shutdown this is expect to not be set
             if (tmpl) {
                 block_template = tmpl;
+                template_backend = backend;
                 uint256 new_prev_hash{block_template->getBlockHeader().hashPrevBlock};
 
                 {
@@ -431,8 +544,6 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 std::this_thread::sleep_for(50ms);
             }
         }
-    } catch (const ipc::Exception& e) {
-        DisconnectBackend("template provider client loop", e);
     } catch (const std::exception& e) {
         LogPrintLevel(BCLog::SV2, BCLog::Level::Trace,
                       "Client thread for id=%zu exiting after exception: %s\n",
