@@ -20,6 +20,42 @@
 // Allow a few seconds for clients to submit a block or to request transactions
 constexpr size_t STALE_TEMPLATE_GRACE_PERIOD{10};
 
+void Sv2TemplateProvider::DisconnectBackend(const char* operation, const std::exception& exception)
+{
+    const bool first_disconnect = !m_backend_disconnected.exchange(true);
+    if (first_disconnect) {
+        LogPrintLevel(BCLog::SV2, BCLog::Level::Error,
+                      "Bitcoin Core IPC connection lost during %s: %s\n",
+                      operation, exception.what());
+    } else {
+        LogPrintLevel(BCLog::SV2, BCLog::Level::Trace,
+                      "Ignoring repeated Bitcoin Core IPC failure during %s: %s\n",
+                      operation, exception.what());
+    }
+
+    m_flag_interrupt_sv2 = true;
+    if (m_connman) m_connman->Interrupt();
+}
+
+void Sv2TemplateProvider::InterruptMining()
+{
+    {
+        LOCK(m_tp_mutex);
+        for (auto& t : GetBlockTemplates()) {
+            try {
+                t.second.second->interruptWait();
+            } catch (const ipc::Exception& e) {
+                DisconnectBackend("interruptWait", e);
+            }
+        }
+    }
+    try {
+        m_mining.interrupt();
+    } catch (const ipc::Exception& e) {
+        DisconnectBackend("interrupt", e);
+    }
+}
+
 Sv2TemplateProvider::Sv2TemplateProvider(interfaces::Mining& mining) : m_mining{mining}
 {
     // TODO: persist static key
@@ -129,15 +165,8 @@ void Sv2TemplateProvider::Interrupt()
     AssertLockNotHeld(m_tp_mutex);
 
     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Interrupt pending mining waits...");
-    {
-        LOCK(m_tp_mutex);
-        for (auto& t : GetBlockTemplates()) {
-            t.second.second->interruptWait();
-        }
-    }
-
     m_flag_interrupt_sv2 = true;
-    m_mining.interrupt();
+    InterruptMining();
     // Also interrupt network threads so client handlers can wind down quickly.
     if (m_connman) m_connman->Interrupt();
 }
@@ -176,70 +205,55 @@ public:
 
 void Sv2TemplateProvider::ThreadSv2Handler()
 {
-    // Make sure it's initialized, doesn't need to be accurate.
-    {
-        LOCK(m_tp_mutex);
-        m_last_block_time = GetTime<std::chrono::seconds>();
-    }
-
-    // Wait to come out of IBD, except on signet, where we might be the only miner.
-    size_t log_ibd{0};
-    while (!m_flag_interrupt_sv2 && gArgs.GetChainType() != ChainType::SIGNET) {
-        // TODO: Wait until there's no headers-only branch with more work than our chaintip.
-        //       The current check can still cause us to broadcast a few dozen useless templates
-        //       at startup.
-        if (!m_mining.isInitialBlockDownload()) break;
-        if (log_ibd == 0) {
-            LogPrintf("Waiting for IBD to complete on %s network before serving templates (this may take a while)\n",
-                      ChainTypeToString(gArgs.GetChainType()));
-        } else if (log_ibd % 10 == 0) {
-            LogPrintf(".\n");
+    try {
+        // Make sure it's initialized, doesn't need to be accurate.
+        {
+            LOCK(m_tp_mutex);
+            m_last_block_time = GetTime<std::chrono::seconds>();
         }
-        log_ibd++;
-        std::this_thread::sleep_for(1000ms);
-    }
 
-    std::map<size_t, std::thread> client_threads;
-
-    while (!m_flag_interrupt_sv2) {
-        // We start with one template per client, which has an interface through
-        // which we monitor for better templates.
-
-        m_connman->ForEachClient([this, &client_threads](Sv2Client& client) {
-            /**
-             * The initial handshake is handled on the Sv2Connman thread. This
-             * consists of the noise protocol handshake and the initial Stratum
-             * v2 messages SetupConnection and CoinbaseOutputConstraints.
-             *
-             * A further refactor should make that part non-blocking. But for
-             * now we spin up a thread here.
-             */
-            if (!client.m_coinbase_output_constraints_recv) return;
-
-            if (client_threads.contains(client.m_id)) return;
-
-            client_threads.emplace(client.m_id,
-                                   std::thread(&util::TraceThread,
-                                               strprintf("sv2-%zu", client.m_id),
-                                               [this, &client] { ThreadSv2ClientHandler(client.m_id); }));
-        });
-
-        // Take a break (handling new connections is not urgent)
-        std::this_thread::sleep_for(100ms);
-
-        LOCK(m_tp_mutex);
-        PruneBlockTemplateCache();
-    }
-
-    for (auto& thread : client_threads) {
-        if (thread.second.joinable()) {
-            // If the node is shutting down, then all pending waitNext() calls
-            // should return in under a second.
-            thread.second.join();
+        // Wait to come out of IBD, except on signet, where we might be the only miner.
+        size_t log_ibd{0};
+        while (!m_flag_interrupt_sv2 && gArgs.GetChainType() != ChainType::SIGNET) {
+            if (!m_mining.isInitialBlockDownload()) break;
+            if (log_ibd == 0) {
+                LogPrintf("Waiting for IBD to complete on %s network before serving templates (this may take a while)\n",
+                          ChainTypeToString(gArgs.GetChainType()));
+            } else if (log_ibd % 10 == 0) {
+                LogPrintf(".\n");
+            }
+            log_ibd++;
+            std::this_thread::sleep_for(1000ms);
         }
+
+        std::map<size_t, std::thread> client_threads;
+
+        while (!m_flag_interrupt_sv2) {
+            m_connman->ForEachClient([this, &client_threads](Sv2Client& client) {
+                if (!client.m_coinbase_output_constraints_recv) return;
+
+                if (client_threads.contains(client.m_id)) return;
+
+                client_threads.emplace(client.m_id,
+                                       std::thread(&util::TraceThread,
+                                                   strprintf("sv2-%zu", client.m_id),
+                                                   [this, &client] { ThreadSv2ClientHandler(client.m_id); }));
+            });
+
+            std::this_thread::sleep_for(100ms);
+
+            LOCK(m_tp_mutex);
+            PruneBlockTemplateCache();
+        }
+
+        for (auto& thread : client_threads) {
+            if (thread.second.joinable()) {
+                thread.second.join();
+            }
+        }
+    } catch (const ipc::Exception& e) {
+        DisconnectBackend("template provider main loop", e);
     }
-
-
 }
 
 void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
@@ -405,6 +419,8 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 std::this_thread::sleep_for(50ms);
             }
         }
+    } catch (const ipc::Exception& e) {
+        DisconnectBackend("template provider client loop", e);
     } catch (const std::exception& e) {
         LogPrintLevel(BCLog::SV2, BCLog::Level::Trace,
                       "Client thread for id=%zu exiting after exception: %s\n",

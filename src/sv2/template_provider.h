@@ -11,6 +11,7 @@
 #include <util/time.h>
 #include <streams.h>
 #include <memory>
+#include <atomic>
 
 using interfaces::BlockTemplate;
 
@@ -86,6 +87,7 @@ private:
      * Signal for handling interrupts and stopping the template provider event loop.
      */
     std::atomic<bool> m_flag_interrupt_sv2{false};
+    std::atomic<bool> m_backend_disconnected{false};
     CThreadInterrupt m_interrupt_sv2;
 
     /**
@@ -123,6 +125,8 @@ public:
      * returns false if port is unable to bind.
      */
     [[nodiscard]] bool Start(const Sv2TemplateProviderOptions& options = {});
+
+    bool BackendDisconnected() const { return m_backend_disconnected.load(); }
 
     /**
      * The main thread for the template provider, contains an event loop handling
@@ -188,6 +192,9 @@ private:
      * account, we set future_template to false and don't send SetNewPrevHash.
      */
     [[nodiscard]] bool SendWork(Sv2Client& client, uint64_t template_id, BlockTemplate& block_template, bool future_template);
+
+    void DisconnectBackend(const char* operation, const std::exception& exception);
+    void InterruptMining();
 
 };
 
