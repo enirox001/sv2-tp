@@ -128,6 +128,7 @@ static bool g_interrupt{false};
 namespace {
 constexpr auto IPC_RECONNECT_INITIAL_DELAY{std::chrono::seconds{1}};
 constexpr auto IPC_RECONNECT_MAX_DELAY{std::chrono::seconds{32}};
+constexpr auto IPC_RECONNECT_POLL_INTERVAL{100ms};
 }
 
 #ifndef WIN32
@@ -261,7 +262,11 @@ MAIN_FUNCTION
                 LogPrintf("IPC connection failed: %s\n", exception.what());
                 LogPrintf("Retrying in %d seconds... (Ensure Bitcoin Core is running with '-ipcbind=unix')\n",
                           retry_delay.count());
-                std::this_thread::sleep_for(retry_delay);
+                auto waited{0ms};
+                while (!g_interrupt && waited < retry_delay) {
+                    std::this_thread::sleep_for(IPC_RECONNECT_POLL_INTERVAL);
+                    waited += IPC_RECONNECT_POLL_INTERVAL;
+                }
                 retry_delay = std::min(retry_delay * 2, IPC_RECONNECT_MAX_DELAY);
             }
         }
@@ -310,6 +315,6 @@ MAIN_FUNCTION
     tp->Interrupt();
     tp->StopThreads();
     tp.reset();
-
-    return EXIT_SUCCESS;
+    RemovePidFile(args);
+    std::_Exit(EXIT_SUCCESS);
 }
