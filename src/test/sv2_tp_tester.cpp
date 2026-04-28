@@ -75,7 +75,8 @@ TPTester::TPTester(Sv2TemplateProviderOptions opts)
     BOOST_REQUIRE(m_mining_proxy != nullptr);
 
     // Construct Template Provider with the IPC-backed Mining proxy
-    m_tp = std::make_unique<Sv2TemplateProvider>(*m_mining_proxy);
+    m_tp = std::make_unique<Sv2TemplateProvider>();
+    m_tp->ReplaceBackend(std::move(m_client_init), std::move(m_mining_proxy));
 
     CreateSock = [this](int, int, int) -> std::unique_ptr<Sock> {
         // This will be the bind/listen socket from m_tp. It will
@@ -93,14 +94,10 @@ TPTester::~TPTester()
         mp::EventLoopRef loop_ref{*m_loop};
         // Destroy objects that may post work to the loop while the loop is guaranteed alive.
         m_tp.reset();
-        m_mining_proxy.reset();
-        m_client_init.reset();
         // Server init can go after clients; it only owns exported capabilities.
         m_server_init.reset();
     } else {
         m_tp.reset();
-        m_mining_proxy.reset();
-        m_client_init.reset();
         m_server_init.reset();
     }
     // Join loop thread (loop exits automatically when refs & connections reach zero).
