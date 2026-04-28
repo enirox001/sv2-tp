@@ -20,6 +20,16 @@
 // Allow a few seconds for clients to submit a block or to request transactions
 constexpr size_t STALE_TEMPLATE_GRACE_PERIOD{10};
 
+template <typename T>
+std::shared_ptr<T> MakeSharedIpcProxy(std::unique_ptr<T> proxy, const std::atomic<bool>& disconnected)
+{
+    return std::shared_ptr<T>(proxy.release(), [&disconnected](T* ptr) {
+        if (!ptr) return;
+        if (disconnected.load()) return;
+        delete ptr;
+    });
+}
+
 void Sv2TemplateProvider::DisconnectBackend(const char* operation, const std::exception& exception)
 {
     const bool first_disconnect = !m_backend_disconnected.exchange(true);
@@ -300,7 +310,8 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 if (!prepare_block_create_options(block_create_options)) break;
 
                 const auto time_start{SteadyClock::now()};
-                block_template = m_mining.createNewBlock(block_create_options);
+                block_template = MakeSharedIpcProxy(m_mining.createNewBlock(block_create_options),
+                                                   m_backend_disconnected);
                 if (!block_template) {
                     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "No new template for client id=%zu, node is shutting down\n",
                         client_id);
@@ -367,7 +378,8 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                               client_id);
             }
 
-            std::shared_ptr<BlockTemplate> tmpl = block_template->waitNext(options);
+            std::shared_ptr<BlockTemplate> tmpl = MakeSharedIpcProxy(block_template->waitNext(options),
+                                                                    m_backend_disconnected);
             // The client may have disconnected during the wait, check now to avoid
             // a spurious IPC call and confusing log statements.
             {

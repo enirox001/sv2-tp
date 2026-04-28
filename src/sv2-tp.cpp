@@ -296,11 +296,17 @@ MAIN_FUNCTION
 
     while (!g_interrupt) {
         LogPrintf("Restarting sv2-tp after Bitcoin Core IPC disconnect\n");
+        const bool backend_disconnected = tp->BackendDisconnected();
         tp->Interrupt();
         tp->StopThreads();
         tp.reset();
-        mining.reset();
-        node_init.reset();
+        if (backend_disconnected) {
+            mining.release();
+            node_init.release();
+        } else {
+            mining.reset();
+            node_init.reset();
+        }
 
         connection = connect_to_node();
         node_init = std::move(connection.first);
