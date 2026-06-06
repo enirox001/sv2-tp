@@ -5,6 +5,7 @@
 #ifndef BITCOIN_TEST_SV2_MOCK_MINING_H
 #define BITCOIN_TEST_SV2_MOCK_MINING_H
 
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -44,7 +45,9 @@ struct MockState {
     std::vector<CTransactionRef> txs; // non-coinbase transactions included in templates
     std::queue<MockEvent> events;    // queued events driving waitNext()
     std::condition_variable_any cv;
+    int wait_next_waiters{0};
     bool shutdown{false};
+    uint64_t wait_interrupt_generation{0};
 };
 
 class MockBlockTemplate : public interfaces::BlockTemplate {
@@ -93,6 +96,7 @@ public:
 
     // Wait until internal template sequence reaches at least target (returns false on timeout/shutdown)
     bool WaitForTemplateSeq(uint64_t target, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
+    bool WaitForWaitNext(std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
 
 private:
     std::shared_ptr<MockState> state;

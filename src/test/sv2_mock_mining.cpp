@@ -66,12 +66,38 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
     auto deadline = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds{static_cast<int64_t>(options.timeout.count())};
     std::unique_lock<Mutex> lk(state->m);
+    struct WaitNextWaiter {
+        explicit WaitNextWaiter(MockState& state) : m_state(state)
+        {
+            ++m_state.wait_next_waiters;
+            m_state.cv.notify_all();
+        }
+
+        ~WaitNextWaiter()
+        {
+            --m_state.wait_next_waiters;
+            m_state.cv.notify_all();
+        }
+
+        MockState& m_state;
+    } waiter{*state};
+
+    const uint64_t observed_interrupt_generation{state->wait_interrupt_generation};
     while (true) {
-        auto predicate = [&] { return state->shutdown || !state->events.empty(); };
+        auto predicate = [&] {
+            return state->shutdown ||
+                   state->wait_interrupt_generation != observed_interrupt_generation ||
+                   !state->events.empty();
+        };
         if (!state->cv.wait_until(lk, deadline, predicate)) {
             return nullptr; // timeout
         }
-        if (state->shutdown) return nullptr;
+        if (state->shutdown) {
+            return nullptr;
+        }
+        if (state->wait_interrupt_generation != observed_interrupt_generation) {
+            return nullptr;
+        }
         if (state->events.empty()) continue; // spurious
         MockEvent ev = state->events.front();
         state->events.pop();
@@ -98,15 +124,16 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
         auto txs = state->txs;
         uint64_t seq = ++state->chain.template_seq;
         state->chain.last_template_fee_sum = state->chain.pending_fee_sum;
-        state->cv.notify_all(); // wake WaitForTemplateSeq waiters
-        lk.unlock();
         return std::make_unique<MockBlockTemplate>(state, prev, std::move(txs), seq);
     }
 }
 
- void MockBlockTemplate::interruptWait()
+void MockBlockTemplate::interruptWait()
 {
-     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "mock interruptWait()");
+    LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "mock interruptWait()");
+    LOCK(state->m);
+    ++state->wait_interrupt_generation;
+    state->cv.notify_all();
 }
 
 MockMining::MockMining(std::shared_ptr<MockState> st) : state(std::move(st)) {}
@@ -140,6 +167,13 @@ bool MockMining::WaitForTemplateSeq(uint64_t target, std::chrono::milliseconds t
     std::unique_lock<Mutex> lk(state->m);
     auto deadline = std::chrono::steady_clock::now() + timeout;
     return state->cv.wait_until(lk, deadline, [&]{ return state->shutdown || state->chain.template_seq >= target; }) && !state->shutdown && state->chain.template_seq >= target;
+}
+
+bool MockMining::WaitForWaitNext(std::chrono::milliseconds timeout)
+{
+    std::unique_lock<Mutex> lk(state->m);
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    return state->cv.wait_until(lk, deadline, [&]{ return state->shutdown || state->wait_next_waiters > 0; }) && !state->shutdown && state->wait_next_waiters > 0;
 }
 
 void MockMining::TriggerFeeIncrease(std::vector<CTransactionRef> txs)

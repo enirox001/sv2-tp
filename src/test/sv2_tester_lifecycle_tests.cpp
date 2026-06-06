@@ -4,8 +4,12 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <test/sv2_mock_mining.h>
 #include <test/sv2_test_setup.h>          // Sv2BasicTestingSetup fixture
 #include <test/sv2_tp_tester.h>
+
+#include <chrono>
+#include <memory>
 
 /*
  * Regression / lifecycle test: construct and destruct TPTester multiple times
@@ -22,16 +26,28 @@ BOOST_AUTO_TEST_CASE(tp_tester_repeated_construction)
     for (int i = 0; i < ITERS; ++i) {
         BOOST_TEST_MESSAGE("Lifecycle iteration " << i);
         {
-            TPTester tester{};
+            Sv2TemplateProviderOptions opts;
+            opts.is_test = false;
+            opts.template_interval = std::chrono::seconds{5};
+
+            auto tester{std::make_unique<TPTester>(opts)};
             // Perform a minimal handshake + setup so the Template Provider
             // allocates resources and creates at least one client connection.
-            tester.handshake();
+            tester->handshake();
 
-            tester.SendSetupConnection();
-            tester.SendCoinbaseOutputConstraints();
-            tester.ReceiveTemplatePair();
+            tester->SendSetupConnection();
+            tester->SendCoinbaseOutputConstraints();
+            tester->ReceiveTemplatePair();
+
+            BOOST_REQUIRE(tester->m_mining_control->WaitForWaitNext());
+
+            const auto destroy_start{std::chrono::steady_clock::now()};
+            tester.reset();
+            const auto destroy_elapsed{std::chrono::steady_clock::now() - destroy_start};
+            const auto destroy_elapsed_ms{std::chrono::duration_cast<std::chrono::milliseconds>(destroy_elapsed).count()};
+            BOOST_CHECK_MESSAGE(destroy_elapsed_ms < 1500, "TPTester teardown took " << destroy_elapsed_ms << "ms");
         }
-        // On leaving scope: destructor of TPTester should cleanly tear down.
+        // The explicit reset above should cleanly tear down.
         // If any dangling references or threads exist they should surface as
         // test hangs or use-after-frees under sanitizers / valgrind.
     }
