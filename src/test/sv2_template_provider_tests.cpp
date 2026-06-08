@@ -1,7 +1,7 @@
 #include <boost/test/unit_test.hpp>
+#include <interfaces/init.h>
 #include <interfaces/mining.h>
 #include <sv2/block_options.h>
-#include <interfaces/init.h>
 #include <sv2/messages.h>
 #include <test/sv2_test_setup.h>
 #include <test/util/net.h>
@@ -13,11 +13,11 @@
 #include <script/script.h>
 
 // Test harness and mocks
-#include <test/sv2_tp_tester.h>
 #include <test/sv2_mock_mining.h>
+#include <test/sv2_tp_tester.h>
 
-#include <future>
 #include <algorithm>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -36,6 +36,24 @@ BOOST_AUTO_TEST_CASE(block_reserved_weight_floor)
     options.block_reserved_weight = 1800;
     options.block_reserved_weight = std::max(node::MIN_BLOCK_RESERVED_WEIGHT, options.block_reserved_weight);
     BOOST_REQUIRE_EQUAL(options.block_reserved_weight, node::MIN_BLOCK_RESERVED_WEIGHT);
+}
+
+BOOST_AUTO_TEST_CASE(multiple_template_pair_trigger)
+{
+    TPTester tester{};
+
+    tester.handshake();
+    tester.SendSetupConnection();
+
+    // Send initial SendCoinbaseOutputConstraints to receive the first TemplatePair
+    tester.SendCoinbaseOutputConstraints();
+    tester.ReceiveTemplatePair();
+
+    BOOST_REQUIRE(tester.m_mining_control->WaitForWaitNext());
+
+    // Send another SendCoinbaseOutputConstraints to receive second ReceiveTemplatePair
+    tester.SendCoinbaseOutputConstraints();
+    tester.ReceiveTemplatePair();
 }
 
 BOOST_AUTO_TEST_CASE(client_tests)
