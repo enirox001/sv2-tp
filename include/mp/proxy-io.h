@@ -384,7 +384,7 @@ struct Waiter
     }
 
     template <class Predicate>
-    void wait(Lock& lock, Predicate pred)
+    void wait(Lock& lock, Predicate pred) MP_REQUIRES(m_mutex)
     {
         m_cv.wait(lock.m_lock, [&]() MP_REQUIRES(m_mutex) {
             // Important for this to be "while (m_fn)", not "if (m_fn)" to avoid
@@ -410,7 +410,7 @@ struct Waiter
     //! EventLoop::m_mutex as long as Waiter::mutex is locked first and
     //! EventLoop::m_mutex is locked second.
     Mutex m_mutex;
-    std::condition_variable m_cv;
+    std::condition_variable m_cv MP_GUARDED_BY(m_mutex);
     std::optional<kj::Function<void()>> m_fn MP_GUARDED_BY(m_mutex);
 };
 
@@ -511,6 +511,7 @@ ProxyClientBase<Interface, Impl>::ProxyClientBase(typename Interface::Client cli
     : m_client(std::move(client)), m_context(connection)
 
 {
+    MP_LOG(*m_context.loop, Log::Debug) << "Creating " << CxxTypeName(*this) << " " << this;
     // Handler for the connection getting destroyed before this client object.
     auto disconnect_cb = m_context.connection->addSyncCleanup([this]() {
         // Release client capability by move-assigning to temporary.
@@ -538,7 +539,12 @@ ProxyClientBase<Interface, Impl>::ProxyClientBase(typename Interface::Client cli
         // the remote object, waiting for it to be deleted server side. If the
         // capnp interface does not define a destroy method, this will just call
         // an empty stub defined in the ProxyClientBase class and do nothing.
-        Sub::destroy(*this);
+        // Exceptions are caught and logged rather than propagated because
+        // ~ProxyClientBase is noexcept and the peer may be gone by the time
+        // this runs.
+        if (kj::runCatchingExceptions([&]{ Sub::destroy(*this); }) != nullptr) {
+            MP_LOG(*m_context.loop, Log::Warning) << "Remote destroy call failed during cleanup. Continuing.";
+        }
 
         // FIXME: Could just invoke removed addCleanup fn here instead of duplicating code
         m_context.loop->sync([&]() {
@@ -567,13 +573,16 @@ ProxyClientBase<Interface, Impl>::ProxyClientBase(typename Interface::Client cli
 template <typename Interface, typename Impl>
 ProxyClientBase<Interface, Impl>::~ProxyClientBase() noexcept
 {
+    MP_LOG(*m_context.loop, Log::Debug) << "Cleaning up " << CxxTypeName(*this) << " " << this;
     CleanupRun(m_context.cleanup_fns);
+    MP_LOG(*m_context.loop, Log::Debug) << "Destroying " << CxxTypeName(*this) << " " << this;
 }
 
 template <typename Interface, typename Impl>
 ProxyServerBase<Interface, Impl>::ProxyServerBase(std::shared_ptr<Impl> impl, Connection& connection)
     : m_impl(std::move(impl)), m_context(&connection)
 {
+    MP_LOG(*m_context.loop, Log::Debug) << "Creating " << CxxTypeName(*this) << " " << this;
     assert(m_impl);
 }
 
@@ -592,6 +601,7 @@ ProxyServerBase<Interface, Impl>::ProxyServerBase(std::shared_ptr<Impl> impl, Co
 template <typename Interface, typename Impl>
 ProxyServerBase<Interface, Impl>::~ProxyServerBase()
 {
+    MP_LOG(*m_context.loop, Log::Debug) << "Cleaning up " << CxxTypeName(*this) << " " << this;
     if (m_impl) {
         // If impl is non-null at this point, it means no client is waiting for
         // the m_impl server object to be destroyed synchronously. This can
@@ -618,6 +628,7 @@ ProxyServerBase<Interface, Impl>::~ProxyServerBase()
         });
     }
     assert(m_context.cleanup_fns.empty());
+    MP_LOG(*m_context.loop, Log::Debug) << "Destroying " << CxxTypeName(*this) << " " << this;
 }
 
 //! If the capnp interface defined a special "destroy" method, as described the
