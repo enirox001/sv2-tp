@@ -1,3 +1,5 @@
+#include <cstdint>
+#include <memory>
 #include <sv2/template_provider.h>
 
 #include <base58.h>
@@ -13,6 +15,7 @@
 #include <util/strencodings.h>
 #include <util/thread.h>
 #include <streams.h>
+#include <sync.h>
 
 #include <algorithm>
 #include <limits>
@@ -273,13 +276,14 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
         std::shared_ptr<BlockTemplate> block_template;
         // Cache most recent block_template->getBlockHeader().hashPrevBlock result.
         uint256 prev_hash;
+
+        // Track the coinbase constraints generation that was active when block_template was built.
+        uint64_t constraints_generation_at_build = 0;
         while (!m_flag_interrupt_sv2) {
             if (!block_template) {
-                LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Generate initial block template for client id=%zu\n",
-                            client_id);
+                LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "%s block template for client id=%zu\n", constraints_generation_at_build == 0 ? "Generate initial" : "Regenerate", client_id);
 
                 // Create block template and store interface reference
-                // TODO: reuse template_id for clients with the same coinbase constraints
                 uint64_t template_id{WITH_LOCK(m_tp_mutex, return ++m_template_id;)};
 
                 node::BlockCreateOptions block_create_options{.use_mempool = true};
@@ -291,6 +295,15 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "No new template for client id=%zu, node is shutting down\n",
                         client_id);
                     break;
+                }
+
+                {
+                    LOCK(m_connman->m_clients_mutex);
+                    std::shared_ptr client = m_connman->GetClientById(client_id);
+                    if (!client) break;
+                    LOCK(client->cs_status);
+                    client->m_current_block_template = block_template;
+                    constraints_generation_at_build = client->m_coinbase_constraints_generation.load();
                 }
 
                 LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Assemble template: %.2fms\n",
@@ -315,6 +328,10 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                     std::shared_ptr client = m_connman->GetClientById(client_id);
                     if (!client) break;
 
+                    if (client->m_coinbase_constraints_generation.load() != constraints_generation_at_build) {
+                        block_template = nullptr;
+                        continue;
+                    }
                     if (!SendWork(*client, template_id, *block_template, /*future_template=*/true)) {
                         LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Disconnecting client id=%zu\n",
                                     client_id);
@@ -358,7 +375,12 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
             // a spurious IPC call and confusing log statements.
             {
                 LOCK(m_connman->m_clients_mutex);
-                if (!m_connman->GetClientById(client_id)) break;
+                if (std::shared_ptr<Sv2Client> client = m_connman->GetClientById(client_id)) {
+                    if (client->m_coinbase_constraints_generation.load() != constraints_generation_at_build) {
+                        block_template = nullptr;
+                        continue;
+                    }
+                } else break;
             }
 
             // After timeout and during node shutdown this is expect to not be set
@@ -389,6 +411,16 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                     std::shared_ptr client = m_connman->GetClientById(client_id);
                     if (!client) break;
 
+                    {
+                        LOCK(client->cs_status);
+                        client->m_current_block_template = block_template;
+                    }
+
+                    if (client->m_coinbase_constraints_generation.load() != constraints_generation_at_build) {
+                        block_template = nullptr;
+                        continue;
+                    }
+
                     if (!SendWork(*client, WITH_LOCK(m_tp_mutex, return m_template_id;), *block_template, future_template)) {
                         LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Disconnecting client id=%zu\n",
                                     client_id);
@@ -403,6 +435,14 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
             if (m_options.is_test) {
                 // Take a break
                 std::this_thread::sleep_for(50ms);
+            }
+        }
+
+        {
+            LOCK(m_connman->m_clients_mutex);
+            if (std::shared_ptr client = m_connman->GetClientById(client_id)) {
+                LOCK(client->cs_status);
+                client->m_current_block_template =nullptr;
             }
         }
     } catch (const std::exception& e) {

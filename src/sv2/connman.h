@@ -6,10 +6,13 @@
 #define BITCOIN_SV2_CONNMAN_H
 
 #include <common/sockman.h>
+#include <interfaces/mining.h>
 #include <sv2/messages.h>
 #include <sv2/transport.h>
 #include <pubkey.h>
 
+#include <atomic>
+#include <threadsafety.h>
 #include <utility>
 
 namespace {
@@ -66,6 +69,18 @@ struct Sv2Client
      * Not guaranteed to still exist.
     */
     uint64_t m_best_template_id = 0;
+
+    /**
+     * Incremented every time a CoinbaseOutputConstraints message is received.
+     * Used by the client handler thread to detect if a template was built with stale constraints.
+    */
+    std::atomic<uint64_t> m_coinbase_constraints_generation{0};
+
+    /**
+     * Pointer to the active block template that the client handler thread is currently waiting on.
+     * Guarded by cs_status to allow the connman thread to safely call interruptWait() on it.
+    */
+    std::shared_ptr<interfaces::BlockTemplate> m_current_block_template GUARDED_BY(cs_status);
 
     explicit Sv2Client(size_t id, std::unique_ptr<Sv2Transport> transport) :
                        m_id{id}, m_transport{std::move(transport)} {};

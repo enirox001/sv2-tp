@@ -369,8 +369,18 @@ void Sv2Connman::ProcessSv2Message(const Sv2NetMsg& sv2_net_msg, Sv2Client& clie
             return;
         }
 
+        // Bump constraints generation and interrupt the client handler thread's
+        // waitNext() call so it immediately rebuilds the template with the new
+        // constraints.
         client.m_coinbase_tx_outputs_size = coinbase_output_constraints.m_coinbase_output_max_additional_size;
+        client.m_coinbase_constraints_generation++;
 
+        {
+            LOCK(client.cs_status);
+            if (client.m_current_block_template != nullptr) {
+                client.m_current_block_template->interruptWait();
+            }
+        }
         break;
     }
     case Sv2MsgType::SUBMIT_SOLUTION: {
