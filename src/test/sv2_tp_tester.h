@@ -67,6 +67,8 @@ public:
     void SendCoinbaseOutputConstraints(size_t peer_id = 0);
     /** Receive a NewTemplate + SetNewPrevHash pair and verify sizes. Returns total bytes. */
     size_t ReceiveTemplatePair(size_t peer_id = 0);
+    /** Disconnect the active IPC stream and install a fresh backend. */
+    void ReconnectBackend();
 
     // SV2 message payload sizes used for test verification
     static constexpr size_t SV2_SET_NEW_PREV_HASH_MSG_SIZE =

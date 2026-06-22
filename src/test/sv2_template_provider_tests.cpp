@@ -38,6 +38,26 @@ BOOST_AUTO_TEST_CASE(block_reserved_weight_floor)
     BOOST_REQUIRE_EQUAL(options.block_reserved_weight, node::MIN_BLOCK_RESERVED_WEIGHT);
 }
 
+BOOST_AUTO_TEST_CASE(resume_after_backend_reconnect)
+{
+    TPTester tester{};
+
+    // Every existing SV2 connection should resume on the new backend generation.
+    for (size_t peer_id = 0; peer_id < 2; ++peer_id) {
+        tester.handshake(peer_id);
+        tester.SendSetupConnection(peer_id);
+        tester.SendCoinbaseOutputConstraints(peer_id);
+        tester.ReceiveTemplatePair(peer_id);
+    }
+    BOOST_REQUIRE(tester.m_mining_control->WaitForWaitNext(/*min_waiters=*/2));
+
+    const uint64_t templates_before_reconnect{tester.m_mining_control->GetTemplateSeq()};
+    tester.ReconnectBackend();
+
+    BOOST_REQUIRE(tester.m_mining_control->WaitForTemplateSeq(templates_before_reconnect + 2));
+    tester.ReceiveTemplatePair(0);
+    tester.ReceiveTemplatePair(1);
+}
 BOOST_AUTO_TEST_CASE(multiple_template_pair_trigger)
 {
     TPTester tester{};

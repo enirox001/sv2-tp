@@ -112,6 +112,31 @@ TPTester::Peer& TPTester::GetPeer(size_t peer_id)
     return m_peers[peer_id];
 }
 
+void TPTester::ReconnectBackend()
+{
+    m_loop->sync([&] {
+        m_loop->m_incoming_connections.clear();
+    });
+
+    const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{2}};
+    while (m_tp->BackendConnected() && std::chrono::steady_clock::now() < deadline) {
+        UninterruptibleSleep(std::chrono::milliseconds{10});
+    }
+    BOOST_REQUIRE(!m_tp->BackendConnected());
+
+    int fds[2];
+    BOOST_REQUIRE_EQUAL(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    m_loop->sync([&] {
+        mp::ServeStream<ipc::capnp::messages::Init>(*m_loop, fds[0], *static_cast<MockInit*>(m_server_init.get()));
+    });
+
+    auto client_init = mp::ConnectStream<ipc::capnp::messages::Init>(*m_loop, fds[1]);
+    BOOST_REQUIRE(client_init != nullptr);
+    auto mining = client_init->makeMining();
+    BOOST_REQUIRE(mining != nullptr);
+    m_tp->ReplaceBackend(std::move(client_init), std::move(mining));
+}
+
 void TPTester::SendPeerBytes(size_t peer_id)
 {
     Peer& peer{GetPeer(peer_id)};
