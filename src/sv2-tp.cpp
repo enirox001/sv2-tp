@@ -283,7 +283,8 @@ MAIN_FUNCTION
     assert(node_init);
     assert(mining);
 
-    auto tp = std::make_unique<Sv2TemplateProvider>(*mining);
+    auto tp = std::make_unique<Sv2TemplateProvider>();
+    tp->ReplaceBackend(std::move(node_init), std::move(mining));
 
     if (!tp->Start(options)) {
         tfm::format(std::cerr, "Unable to start Stratum v2 Template Provider");
