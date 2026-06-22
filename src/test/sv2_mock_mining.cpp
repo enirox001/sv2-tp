@@ -82,10 +82,13 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
         MockState& m_state;
     } waiter{*state};
 
+    ++state->wait_next_calls;
+    state->cv.notify_all();
     const uint64_t observed_interrupt_generation{state->wait_interrupt_generation};
     while (true) {
         auto predicate = [&] {
             return state->shutdown ||
+                   state->return_null_wait_next ||
                    state->wait_interrupt_generation != observed_interrupt_generation ||
                    !state->events.empty();
         };
@@ -93,6 +96,9 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
             return nullptr; // timeout
         }
         if (state->shutdown) {
+            return nullptr;
+        }
+        if (state->return_null_wait_next) {
             return nullptr;
         }
         if (state->wait_interrupt_generation != observed_interrupt_generation) {
@@ -138,7 +144,13 @@ void MockBlockTemplate::interruptWait()
 
 MockMining::MockMining(std::shared_ptr<MockState> st) : state(std::move(st)) {}
 bool MockMining::isTestChain() { return true; }
-bool MockMining::isInitialBlockDownload() { return false; }
+bool MockMining::isInitialBlockDownload()
+{
+    LOCK(state->m);
+    ++state->initial_block_download_checks;
+    state->cv.notify_all();
+    return false;
+}
 std::optional<interfaces::BlockRef> MockMining::getTip() { return std::nullopt; }
 std::optional<interfaces::BlockRef> MockMining::waitTipChanged(uint256, MillisecondsDouble) { return std::nullopt; }
 std::unique_ptr<interfaces::BlockTemplate> MockMining::createNewBlock(const node::BlockCreateOptions&, bool)
@@ -149,6 +161,18 @@ std::unique_ptr<interfaces::BlockTemplate> MockMining::createNewBlock(const node
 }
 void MockMining::interrupt() { LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "mock interrupt()"); }
 bool MockMining::checkBlock(const CBlock&, const node::BlockCheckOptions&, std::string&, std::string&) { return true; }
+
+uint64_t MockMining::GetInitialBlockDownloadChecks()
+{
+    LOCK(state->m);
+    return state->initial_block_download_checks;
+}
+
+uint64_t MockMining::GetWaitNextCalls()
+{
+    LOCK(state->m);
+    return state->wait_next_calls;
+}
 
 uint64_t MockMining::GetTemplateSeq()
 {
@@ -169,6 +193,24 @@ bool MockMining::WaitForTemplateSeq(uint64_t target, std::chrono::milliseconds t
     return state->cv.wait_until(lk, deadline, [&]{ return state->shutdown || state->chain.template_seq >= target; }) && !state->shutdown && state->chain.template_seq >= target;
 }
 
+bool MockMining::WaitForInitialBlockDownloadChecks(uint64_t target, std::chrono::milliseconds timeout)
+{
+    std::unique_lock<Mutex> lk(state->m);
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    return state->cv.wait_until(lk, deadline, [&] {
+        return state->shutdown || state->initial_block_download_checks >= target;
+    }) && !state->shutdown && state->initial_block_download_checks >= target;
+}
+
+bool MockMining::WaitForWaitNextCalls(uint64_t target, std::chrono::milliseconds timeout)
+{
+    std::unique_lock<Mutex> lk(state->m);
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    return state->cv.wait_until(lk, deadline, [&] {
+        return state->shutdown || state->wait_next_calls >= target;
+    }) && !state->shutdown && state->wait_next_calls >= target;
+}
+
 bool MockMining::WaitForWaitNext(std::chrono::milliseconds timeout)
 {
     std::unique_lock<Mutex> lk(state->m);
@@ -186,6 +228,12 @@ void MockMining::TriggerNewTip()
 {
     LOCK(state->m);
     state->events.push(MockEvent{MockEvent::Type::NewTip, {}});
+    state->cv.notify_all();
+}
+void MockMining::SetWaitNextReturnsNull(bool value)
+{
+    LOCK(state->m);
+    state->return_null_wait_next = value;
     state->cv.notify_all();
 }
 void MockMining::Shutdown()

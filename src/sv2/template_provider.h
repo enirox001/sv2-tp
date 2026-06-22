@@ -2,6 +2,7 @@
 #define BITCOIN_SV2_TEMPLATE_PROVIDER_H
 
 #include <chrono>
+#include <interfaces/init.h>
 #include <interfaces/mining.h>
 #include <sv2/connman.h>
 #include <sv2/messages.h>
@@ -11,6 +12,8 @@
 #include <util/time.h>
 #include <streams.h>
 #include <memory>
+#include <atomic>
+#include <condition_variable>
 
 using interfaces::BlockTemplate;
 
@@ -53,10 +56,31 @@ class Sv2TemplateProvider : public Sv2EventsInterface
 
 private:
     /**
-    * The Mining interface is used to build new valid blocks, get the best known
-    * block hash and to check whether the node is still in IBD.
+    * The active Bitcoin Core IPC backend generation.
     */
-    interfaces::Mining& m_mining;
+    struct BackendSession {
+        explicit BackendSession(std::unique_ptr<interfaces::Init> init, std::unique_ptr<interfaces::Mining> mining);
+
+        bool MarkDisconnected()
+        {
+            return !m_disconnected.exchange(true);
+        }
+
+        bool Disconnected() const
+        {
+            return m_disconnected.load();
+        }
+
+        interfaces::Mining& Mining()
+        {
+            return *m_mining;
+        }
+
+    private:
+        std::atomic<bool> m_disconnected{false};
+        std::unique_ptr<interfaces::Init> m_init;
+        std::unique_ptr<interfaces::Mining> m_mining;
+    };
 
     /*
      * The template provider subprotocol used in setup connection messages. The stratum v2
@@ -87,6 +111,9 @@ private:
      */
     std::atomic<bool> m_flag_interrupt_sv2{false};
     CThreadInterrupt m_interrupt_sv2;
+    Mutex m_backend_mutex;
+    std::condition_variable_any m_backend_cv;
+    std::shared_ptr<BackendSession> m_backend GUARDED_BY(m_backend_mutex);
 
     /**
      * The most recent template id. This is incremented on creating new template,
@@ -112,9 +139,9 @@ private:
     BlockTemplateCache m_block_template_cache GUARDED_BY(m_tp_mutex);
 
 public:
-    explicit Sv2TemplateProvider(interfaces::Mining& mining);
+    Sv2TemplateProvider();
 
-    ~Sv2TemplateProvider() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+    ~Sv2TemplateProvider() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex, !m_backend_mutex);
 
     Mutex m_tp_mutex;
 
@@ -124,11 +151,15 @@ public:
      */
     [[nodiscard]] bool Start(const Sv2TemplateProviderOptions& options = {});
 
+    bool BackendConnected() EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex);
+    void ReplaceBackend(std::unique_ptr<interfaces::Init> node_init,
+                        std::unique_ptr<interfaces::Mining> mining) EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex, !m_tp_mutex);
+
     /**
      * The main thread for the template provider, contains an event loop handling
      * all tasks for the template provider.
      */
-    void ThreadSv2Handler() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+    void ThreadSv2Handler() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex, !m_backend_mutex);
 
     /**
      * Give each client its own thread so they're treated equally
@@ -140,13 +171,13 @@ public:
      * connection. For the use case of a public facing template provider,
      * further changes are needed anyway e.g. for DoS resistance.
      */
-    void ThreadSv2ClientHandler(size_t client_id) EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+    void ThreadSv2ClientHandler(size_t client_id) EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex, !m_backend_mutex);
 
     /**
      * Triggered on interrupt signals to stop the main event loop in ThreadSv2Handler().
      * Interrupts pending waitNext() calls
      */
-    void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+    void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex, !m_backend_mutex);
 
     /**
      * Tear down of the template provider thread and any other necessary tear down.
@@ -188,6 +219,12 @@ private:
      * account, we set future_template to false and don't send SetNewPrevHash.
      */
     [[nodiscard]] bool SendWork(Sv2Client& client, uint64_t template_id, BlockTemplate& block_template, bool future_template);
+
+    void ClearTemplateCache(bool log_dropped_templates) EXCLUSIVE_LOCKS_REQUIRED(m_tp_mutex);
+    std::shared_ptr<BackendSession> WaitForBackend() EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex);
+    void DisconnectBackend(const std::shared_ptr<BackendSession>& backend, const char* operation, const std::exception& exception)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex, !m_tp_mutex);
+    void InterruptBackend() EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex, !m_tp_mutex);
 
 };
 
