@@ -299,8 +299,20 @@ MAIN_FUNCTION
     registerSignalHandler(SIGINT, HandleSIGTERM);
 #endif
 
-    while(!g_interrupt) {
-        UninterruptibleSleep(100ms);
+    while (!g_interrupt) {
+        if (tp->BackendConnected()) {
+            UninterruptibleSleep(100ms);
+            continue;
+        }
+
+        LogPrintf("Bitcoin Core IPC disconnected; reconnecting before resuming template creation\n");
+        connection = connect_to_node();
+        node_init = std::move(connection.first);
+        mining = std::move(connection.second);
+        if (g_interrupt) break;
+        assert(node_init);
+        assert(mining);
+        tp->ReplaceBackend(std::move(node_init), std::move(mining));
     }
 
     tp->Interrupt();
