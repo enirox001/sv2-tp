@@ -20,6 +20,11 @@
 #include <algorithm>
 #include <limits>
 
+namespace {
+// Keep probing the backend even when no client handler is making template IPC calls.
+constexpr auto BACKEND_LIVENESS_CHECK_INTERVAL{1000ms};
+}
+
 // Allow a few seconds for clients to submit a block or to request transactions
 constexpr size_t STALE_TEMPLATE_GRACE_PERIOD{10};
 
@@ -303,6 +308,7 @@ void Sv2TemplateProvider::ThreadSv2Handler()
 
     std::map<size_t, std::thread> client_threads;
     std::shared_ptr<BackendSession> checked_ibd_backend;
+    auto next_backend_liveness_check{SteadyClock::now()};
 
     while (!m_flag_interrupt_sv2) {
         std::shared_ptr<BackendSession> backend;
@@ -313,12 +319,16 @@ void Sv2TemplateProvider::ThreadSv2Handler()
 
         // Wait to come out of IBD, except on signet, where we might be the only miner.
         if (backend != checked_ibd_backend && gArgs.GetChainType() != ChainType::SIGNET) {
+            if (SteadyClock::now() < next_backend_liveness_check) {
+                std::this_thread::sleep_for(100ms);
+                continue;
+            }
+            next_backend_liveness_check = SteadyClock::now() + BACKEND_LIVENESS_CHECK_INTERVAL;
             try {
                 // TODO: Wait until there's no headers-only branch with more work than our chaintip.
                 //       The current check can still cause us to broadcast a few dozen useless templates
                 //       at startup.
                 if (backend && backend->Mining().isInitialBlockDownload()) {
-                    std::this_thread::sleep_for(1000ms);
                     continue;
                 }
             } catch (const ipc::Exception& e) {
@@ -326,6 +336,15 @@ void Sv2TemplateProvider::ThreadSv2Handler()
                 continue;
             }
             checked_ibd_backend = backend;
+        } else if (backend && SteadyClock::now() >= next_backend_liveness_check) {
+            next_backend_liveness_check = SteadyClock::now() + BACKEND_LIVENESS_CHECK_INTERVAL;
+            try {
+                // Detect backend shutdown even when no client handler is making IPC calls.
+                backend->Mining().getTip();
+            } catch (const ipc::Exception& e) {
+                DisconnectBackend(backend, "template provider liveness check", e);
+                continue;
+            }
         }
 
         // We start with one template per client, which has an interface through

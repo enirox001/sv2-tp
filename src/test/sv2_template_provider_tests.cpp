@@ -38,6 +38,19 @@ BOOST_AUTO_TEST_CASE(block_reserved_weight_floor)
     BOOST_REQUIRE_EQUAL(options.block_reserved_weight, node::MIN_BLOCK_RESERVED_WEIGHT);
 }
 
+BOOST_AUTO_TEST_CASE(ibd_check_once_per_backend)
+{
+    TPTester tester{};
+
+    // IBD should be checked once for a backend generation, not on every main
+    // loop tick after the backend has already been accepted.
+    BOOST_REQUIRE(tester.m_mining_control->WaitForInitialBlockDownloadChecks(1));
+    const uint64_t checks{tester.m_mining_control->GetInitialBlockDownloadChecks()};
+
+    UninterruptibleSleep(std::chrono::milliseconds{350});
+    BOOST_REQUIRE_EQUAL(tester.m_mining_control->GetInitialBlockDownloadChecks(), checks);
+}
+
 BOOST_AUTO_TEST_CASE(resume_after_backend_reconnect)
 {
     TPTester tester{};

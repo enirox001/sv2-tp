@@ -46,6 +46,7 @@ struct MockState {
     std::queue<MockEvent> events;    // queued events driving waitNext()
     std::condition_variable_any cv;
     int wait_next_waiters{0};
+    uint64_t initial_block_download_checks{0};
     bool shutdown{false};
     uint64_t wait_interrupt_generation{0};
 };
@@ -90,6 +91,7 @@ public:
     bool checkBlock(const CBlock&, const node::BlockCheckOptions&, std::string&, std::string&) override;
 
     // Accessors for tests (thread-safe)
+    uint64_t GetInitialBlockDownloadChecks();
     uint64_t GetTemplateSeq();
     uint64_t GetHeight();
 
@@ -102,6 +104,7 @@ public:
     void Shutdown();
 
     // Wait until internal template sequence reaches at least target (returns false on timeout/shutdown)
+    bool WaitForInitialBlockDownloadChecks(uint64_t target, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
     bool WaitForTemplateSeq(uint64_t target, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
     // Wait until at least min_waiters threads are blocked in waitNext (returns false on timeout/shutdown)
     bool WaitForWaitNext(int min_waiters = 1, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
