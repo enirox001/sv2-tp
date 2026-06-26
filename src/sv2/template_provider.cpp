@@ -24,6 +24,15 @@ namespace {
 constexpr auto WAIT_NEXT_RETRY_INITIAL_DELAY{100ms};
 constexpr auto WAIT_NEXT_RETRY_MAX_DELAY{1000ms};
 constexpr auto BACKEND_LIVENESS_CHECK_INTERVAL{1000ms};
+
+CAmount TotalFees(interfaces::BlockTemplate& block_template)
+{
+    CAmount total_fees{0};
+    for (const CAmount fee : block_template.getTxFees()) {
+        total_fees += fee;
+    }
+    return total_fees;
+}
 }
 
 Sv2TemplateProvider::BackendSession::BackendSession(std::unique_ptr<interfaces::Init> init,
@@ -76,12 +85,17 @@ void Sv2TemplateProvider::DisconnectBackend(const std::shared_ptr<BackendSession
         LOCK(m_backend_mutex);
         if (m_backend == backend) {
             active_backend = m_backend;
-            LOCK(m_tp_mutex);
-            ClearTemplateCache(/*log_dropped_templates=*/true);
             m_backend.reset();
         }
     }
     if (!active_backend) return;
+
+    m_connman->ClearCurrentBlockTemplates();
+
+    {
+        LOCK(m_tp_mutex);
+        ClearTemplateCache(/*log_dropped_templates=*/true);
+    }
 
     if (first_disconnect) {
         LogPrintLevel(BCLog::SV2, BCLog::Level::Error,
@@ -418,6 +432,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
         std::shared_ptr<BackendSession> template_backend;
         // Cache most recent block_template->getBlockHeader().hashPrevBlock result.
         uint256 prev_hash;
+        CAmount last_template_fees{0};
 
         // Track the coinbase constraints generation that was active when block_template was built.
         uint64_t constraints_generation_at_build = 0;
@@ -477,8 +492,9 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
 
                 try {
                     prev_hash = block_template->getBlockHeader().hashPrevBlock;
+                    last_template_fees = TotalFees(*block_template);
                 } catch (const ipc::Exception& e) {
-                    DisconnectBackend(backend, "getBlockHeader", e);
+                    DisconnectBackend(backend, "initial template inspection", e);
                     backend.reset();
                     continue;
                 }
@@ -584,10 +600,12 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 block_template = tmpl;
                 template_backend = backend;
                 uint256 new_prev_hash;
+                CAmount new_template_fees{0};
                 try {
                     new_prev_hash = block_template->getBlockHeader().hashPrevBlock;
+                    new_template_fees = TotalFees(*block_template);
                 } catch (const ipc::Exception& e) {
-                    DisconnectBackend(template_backend, "getBlockHeader", e);
+                    DisconnectBackend(template_backend, "updated template inspection", e);
                     backend.reset();
                     block_template.reset();
                     template_backend.reset();
@@ -603,6 +621,16 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                         m_best_prev_hash = new_prev_hash;
                         // Does not need to be accurate
                         m_last_block_time = GetTime<std::chrono::seconds>();
+                    } else if (!check_fees) {
+                        LogPrintLevel(BCLog::SV2, BCLog::Level::Trace,
+                                      "Ignore same-tip template while fee updates are suppressed, client id=%zu\n",
+                                      client_id);
+                        continue;
+                    } else if (new_template_fees < last_template_fees + fee_delta) {
+                        LogPrintLevel(BCLog::SV2, BCLog::Level::Trace,
+                                      "Ignore same-tip template with %lld sat fee delta, client id=%zu\n",
+                                      static_cast<long long>(new_template_fees - last_template_fees), client_id);
+                        continue;
                     }
 
                     ++m_template_id;
@@ -643,6 +671,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 }
 
                 timer.reset();
+                last_template_fees = new_template_fees;
                 wait_next_retry_delay = WAIT_NEXT_RETRY_INITIAL_DELAY;
             }
 

@@ -75,6 +75,15 @@ void Sv2Connman::DisconnectFlagged()
     }
 }
 
+void Sv2Connman::ClearCurrentBlockTemplates()
+{
+    LOCK(m_clients_mutex);
+    for (const auto& client : m_sv2_clients) {
+        LOCK(client.second->cs_status);
+        client.second->m_current_block_template.reset();
+    }
+}
+
 void Sv2Connman::EventIOLoopCompletedForAll()
 {
     LOCK(m_clients_mutex);

@@ -251,6 +251,8 @@ public:
         }
     };
 
+    void ClearCurrentBlockTemplates() EXCLUSIVE_LOCKS_REQUIRED(!m_clients_mutex);
+
     /** Number of clients that are not marked for disconnection, used for tests. */
     size_t ConnectedClients() EXCLUSIVE_LOCKS_REQUIRED(m_clients_mutex)
     {
