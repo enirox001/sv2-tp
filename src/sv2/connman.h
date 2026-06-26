@@ -159,7 +159,11 @@ private:
      */
     [[nodiscard]] bool Bind(std::string host, uint16_t port);
 
-    void DisconnectFlagged() EXCLUSIVE_LOCKS_REQUIRED(m_clients_mutex);
+    /**
+     * Disconnect clients once their send queue has drained.
+     * Returns template waits that should be interrupted outside m_clients_mutex.
+     */
+    std::vector<std::shared_ptr<interfaces::BlockTemplate>> DisconnectFlagged() EXCLUSIVE_LOCKS_REQUIRED(m_clients_mutex);
 
     std::pair<size_t, bool> SendMessagesAsBytes(Sv2Client& client)
         EXCLUSIVE_LOCKS_REQUIRED(client.cs_send);
@@ -250,6 +254,16 @@ public:
             if (client.second->IsFullyConnected()) func(*client.second);
         }
     };
+
+    /**
+     * Clear template proxies currently held by connected clients.
+     */
+    void ClearCurrentBlockTemplates() EXCLUSIVE_LOCKS_REQUIRED(!m_clients_mutex);
+
+    /**
+     * Return template proxies currently held by connected clients.
+     */
+    std::vector<std::shared_ptr<interfaces::BlockTemplate>> GetCurrentBlockTemplates() EXCLUSIVE_LOCKS_REQUIRED(!m_clients_mutex);
 
     /** Number of clients that are not marked for disconnection, used for tests. */
     size_t ConnectedClients() EXCLUSIVE_LOCKS_REQUIRED(m_clients_mutex)

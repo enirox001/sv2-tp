@@ -14,6 +14,7 @@ Sv2Connman::~Sv2Connman()
 {
     AssertLockNotHeld(m_clients_mutex);
 
+    std::vector<std::shared_ptr<interfaces::BlockTemplate>> templates_to_interrupt;
     {
         LOCK(m_clients_mutex);
         for (const auto& client : m_sv2_clients) {
@@ -21,7 +22,15 @@ Sv2Connman::~Sv2Connman()
                     client.first);
             client.second->m_disconnect_flag = true;
         }
-        DisconnectFlagged();
+        templates_to_interrupt = DisconnectFlagged();
+    }
+
+    for (const auto& tmpl : templates_to_interrupt) {
+        try {
+            tmpl->interruptWait();
+        } catch (const std::exception&) {
+            // Ignore errors when interrupting a disconnected client's wait
+        }
     }
 
     Interrupt();
@@ -56,9 +65,11 @@ bool Sv2Connman::Bind(std::string host, uint16_t port)
 }
 
 
-void Sv2Connman::DisconnectFlagged()
+std::vector<std::shared_ptr<interfaces::BlockTemplate>> Sv2Connman::DisconnectFlagged()
 {
     AssertLockHeld(m_clients_mutex);
+
+    std::vector<std::shared_ptr<interfaces::BlockTemplate>> templates_to_interrupt;
 
     // Remove clients that are flagged for disconnection.
     auto it = m_sv2_clients.begin();
@@ -68,17 +79,59 @@ void Sv2Connman::DisconnectFlagged()
         LOCK(client->cs_status);
         if (client->m_send_messages.empty() && client->m_disconnect_flag) {
             CloseConnection(it->second->m_id);
+            if (client->m_current_block_template) {
+                // interruptWait() can call into IPC, so return the proxy and
+                // interrupt it after m_clients_mutex is released.
+                templates_to_interrupt.push_back(client->m_current_block_template);
+            }
             it = m_sv2_clients.erase(it);
         } else {
             it++;
         }
     }
+
+    return templates_to_interrupt;
+}
+
+void Sv2Connman::ClearCurrentBlockTemplates()
+{
+    LOCK(m_clients_mutex);
+    for (const auto& client : m_sv2_clients) {
+        LOCK(client.second->cs_status);
+        client.second->m_current_block_template.reset();
+    }
+}
+
+std::vector<std::shared_ptr<interfaces::BlockTemplate>> Sv2Connman::GetCurrentBlockTemplates()
+{
+    std::vector<std::shared_ptr<interfaces::BlockTemplate>> templates;
+    LOCK(m_clients_mutex);
+    for (const auto& client : m_sv2_clients) {
+        LOCK(client.second->cs_status);
+        if (client.second->m_current_block_template) {
+            templates.push_back(client.second->m_current_block_template);
+        }
+    }
+    return templates;
 }
 
 void Sv2Connman::EventIOLoopCompletedForAll()
 {
-    LOCK(m_clients_mutex);
-    DisconnectFlagged();
+    // Disconnect flagged clients once queued sends have drained, then wake any
+    // client handler blocked on that client's current template.
+    std::vector<std::shared_ptr<interfaces::BlockTemplate>> templates_to_interrupt;
+    {
+        LOCK(m_clients_mutex);
+        templates_to_interrupt = DisconnectFlagged();
+    }
+
+    for (const auto& tmpl : templates_to_interrupt) {
+        try {
+            tmpl->interruptWait();
+        } catch (const std::exception&) {
+            // Ignore errors when interrupting a disconnected client's wait
+        }
+    }
 }
 
 void Sv2Connman::Interrupt()
