@@ -27,6 +27,17 @@ constexpr auto WAIT_NEXT_RETRY_MAX_DELAY{1000ms};
 
 // Keep probing the backend even when no client handler is making template IPC calls.
 constexpr auto BACKEND_LIVENESS_CHECK_INTERVAL{1000ms};
+
+CAmount GetTemplateFees(BlockTemplate& block_template)
+{
+    // BlockTemplate exposes fees per transaction. The same-tip filter only
+    // needs the total fee delta from the last template sent to this client.
+    CAmount total_fees{0};
+    for (const CAmount fee : block_template.getTxFees()) {
+        total_fees += fee;
+    }
+    return total_fees;
+}
 }
 
 // Allow a few seconds for clients to submit a block or to request transactions
@@ -612,12 +623,12 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
             }
 
             if (tmpl) {
-                block_template = tmpl;
-                template_backend = backend;
-
+                // Inspect the candidate before adopting it. If it is a
+                // redundant same-tip template, leave the current template as
+                // the client's active work and do not assign a new template id.
                 uint256 new_prev_hash;
                 try {
-                    new_prev_hash = block_template->getBlockHeader().hashPrevBlock;
+                    new_prev_hash = tmpl->getBlockHeader().hashPrevBlock;
                 } catch (const ipc::Exception& e) {
                     DisconnectBackend(template_backend, "getBlockHeader", e);
                     backend.reset();
@@ -626,15 +637,40 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                     continue;
                 }
 
+                const bool tip_changed{new_prev_hash != prev_hash};
+
+                if (!tip_changed && !check_fees) {
+                    wait_next_retry_delay = WAIT_NEXT_RETRY_INITIAL_DELAY;
+                    continue;
+                }
+                if (!tip_changed) {
+                    try {
+                        const CAmount previous_fees{GetTemplateFees(*block_template)};
+                        const CAmount new_fees{GetTemplateFees(*tmpl)};
+                        if (new_fees < previous_fees + fee_delta) {
+                            wait_next_retry_delay = WAIT_NEXT_RETRY_INITIAL_DELAY;
+                            continue;
+                        }
+                    } catch (const ipc::Exception& e) {
+                        DisconnectBackend(template_backend, "getTxFees", e);
+                        backend.reset();
+                        block_template.reset();
+                        template_backend.reset();
+                        continue;
+                    }
+                }
+
+                // The candidate passed the new-tip or fee-delta filter, so it
+                // becomes the client's current template and can be cached/sent.
+                block_template = tmpl;
+                template_backend = backend;
+
                 // Compare against the handler-local prev_hash, not the shared
-                // m_best_prev_hash: another client handler may have already
-                // updated the latter for the same tip, but this client still
-                // needs its own SetNewPrevHash message.
-                if (new_prev_hash != prev_hash) {
+                // m_best_prev_hash: every client needs its own SetNewPrevHash.
+                if (tip_changed) {
                     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Tip changed, client id=%zu\n",
                         client_id);
                     future_template = true;
-                    prev_hash = new_prev_hash;
                 }
 
                 {
@@ -677,6 +713,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                     continue;
                 }
 
+                prev_hash = new_prev_hash;
                 timer.reset();
                 wait_next_retry_delay = WAIT_NEXT_RETRY_INITIAL_DELAY;
             }
@@ -908,10 +945,7 @@ bool Sv2TemplateProvider::SendWork(Sv2Client& client, uint64_t template_id, Bloc
         m_connman->TryOptimisticSend(client);
     }
 
-    CAmount total_fees{0};
-    for (const CAmount fee : block_template.getTxFees()) {
-        total_fees += fee;
-    }
+    const CAmount total_fees{GetTemplateFees(block_template)};
     LogPrintLevel(BCLog::SV2, BCLog::Level::Debug,
                   "Template %lu includes %lld sat in fees\n",
                   template_id,

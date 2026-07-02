@@ -91,6 +91,28 @@ BOOST_AUTO_TEST_CASE(resume_after_backend_reconnect)
     tester.ReceiveTemplatePair(0);
     tester.ReceiveTemplatePair(1);
 }
+
+BOOST_AUTO_TEST_CASE(suppress_below_threshold_same_tip_template)
+{
+    TPTester tester{};
+
+    tester.handshake();
+    tester.SendSetupConnection();
+    tester.SendCoinbaseOutputConstraints();
+    tester.ReceiveTemplatePair();
+    BOOST_REQUIRE(tester.m_mining_control->WaitForWaitNext());
+
+    const uint64_t sequence{tester.m_mining_control->GetTemplateSeq()};
+    const uint64_t wait_calls{tester.m_mining_control->GetWaitNextCalls()};
+    tester.m_mining_control->TriggerSameTipTemplate(/*total_fees=*/500);
+
+    // The mock deliberately violates waitNext's fee threshold. The provider's
+    // defensive filter must reject it and resume waiting on the current work.
+    BOOST_REQUIRE(tester.m_mining_control->WaitForTemplateSeq(sequence + 1));
+    BOOST_REQUIRE(tester.m_mining_control->WaitForWaitNextCalls(wait_calls + 1));
+    BOOST_REQUIRE_EQUAL(tester.GetBlockTemplateCount(), 1);
+}
+
 BOOST_AUTO_TEST_CASE(multiple_template_pair_trigger)
 {
     TPTester tester{};

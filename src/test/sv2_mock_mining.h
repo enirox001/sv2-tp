@@ -49,6 +49,7 @@ struct MockState {
     uint64_t wait_next_calls{0};
     uint64_t initial_block_download_checks{0};
     bool return_null_wait_next{false};
+    bool force_same_tip_template{false};
     bool shutdown{false};
     uint64_t wait_interrupt_generation{0};
 };
@@ -100,6 +101,7 @@ public:
 
     // Test control helpers
     void TriggerFeeIncrease(std::vector<CTransactionRef> txs);
+    void TriggerSameTipTemplate(CAmount total_fees);
     //! Advance the chain tip. Like the real node, this is observed by every
     //! concurrent waitNext() caller, each of which returns a template for the
     //! new tip.

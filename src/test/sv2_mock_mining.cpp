@@ -95,6 +95,7 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
         auto predicate = [&] {
             return state->shutdown ||
                    state->return_null_wait_next ||
+                   state->force_same_tip_template ||
                    state->wait_interrupt_generation != observed_interrupt_generation ||
                    state->chain.prev_hash != block.hashPrevBlock ||
                    !state->events.empty();
@@ -107,6 +108,12 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
         }
         if (state->return_null_wait_next) {
             return nullptr;
+        }
+        if (state->force_same_tip_template) {
+            state->force_same_tip_template = false;
+            auto txs = state->txs;
+            uint64_t seq = ++state->chain.template_seq;
+            return std::make_unique<MockBlockTemplate>(state, state->chain.prev_hash, std::move(txs), seq, state->chain.pending_fee_sum);
         }
         if (state->wait_interrupt_generation != observed_interrupt_generation) {
             return nullptr;
@@ -235,6 +242,14 @@ void MockMining::TriggerFeeIncrease(std::vector<CTransactionRef> txs)
 {
     LOCK(state->m);
     state->events.push(MockEvent{MockEvent::Type::FeeIncrease, std::move(txs)});
+    state->cv.notify_all();
+}
+void MockMining::TriggerSameTipTemplate(CAmount total_fees)
+{
+    assert(total_fees >= 0);
+    LOCK(state->m);
+    state->chain.pending_fee_sum = static_cast<uint64_t>(total_fees);
+    state->force_same_tip_template = true;
     state->cv.notify_all();
 }
 void MockMining::TriggerNewTip()
