@@ -389,12 +389,22 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 block_template = tmpl;
                 uint256 new_prev_hash{block_template->getBlockHeader().hashPrevBlock};
 
+                // Compare against the handler-local prev_hash, not the shared
+                // m_best_prev_hash: another client handler may have already
+                // updated the latter for the same tip, but this client still
+                // needs its own SetNewPrevHash message.
+                if (new_prev_hash != prev_hash) {
+                    LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Tip changed, client id=%zu\n",
+                        client_id);
+                    future_template = true;
+                    prev_hash = new_prev_hash;
+                }
+
                 {
                     LOCK(m_tp_mutex);
+                    // m_best_prev_hash only tracks the best tip for template
+                    // cache pruning, not per-client delivery state.
                     if (new_prev_hash != m_best_prev_hash) {
-                        LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Tip changed, client id=%zu\n",
-                            client_id);
-                        future_template = true;
                         m_best_prev_hash = new_prev_hash;
                         // Does not need to be accurate
                         m_last_block_time = GetTime<std::chrono::seconds>();

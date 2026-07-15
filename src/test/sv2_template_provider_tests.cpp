@@ -226,6 +226,40 @@ BOOST_AUTO_TEST_CASE(client_tests)
     tester.m_mining_control->Shutdown();
 }
 
+// After a tip change, every connected client must receive NewTemplate
+// (future_template=true) followed by the matching SetNewPrevHash — not just
+// the client whose handler processes the new tip first.
+// Regression test for https://github.com/stratum-mining/sv2-tp/issues/111
+BOOST_AUTO_TEST_CASE(two_clients_receive_set_new_prev_hash)
+{
+    TPTester tester{};
+
+    // Connect two clients; each gets an initial NewTemplate + SetNewPrevHash.
+    for (size_t peer_id = 0; peer_id < 2; ++peer_id) {
+        tester.handshake(peer_id);
+        tester.SendSetupConnection(peer_id);
+        tester.SendCoinbaseOutputConstraints(peer_id);
+        tester.ReceiveTemplatePair(peer_id);
+    }
+
+    // Wait until both client handler threads are waiting for template updates.
+    BOOST_REQUIRE(tester.m_mining_control->WaitForWaitNext(/*min_waiters=*/2));
+
+    uint64_t seq = tester.m_mining_control->GetTemplateSeq();
+
+    BOOST_TEST_MESSAGE("Create a new block (new tip)");
+    tester.m_mining_control->TriggerNewTip();
+
+    // Both handlers must build a template for the new tip...
+    BOOST_REQUIRE(tester.m_mining_control->WaitForTemplateSeq(seq + 2));
+
+    // ...and both clients must receive NewTemplate + SetNewPrevHash.
+    tester.ReceiveTemplatePair(0);
+    tester.ReceiveTemplatePair(1);
+
+    tester.m_mining_control->Shutdown();
+}
+
 // Test fee-based rate limiting timer (-templateinterval flag).
 // Uses is_test=false to exercise actual timer logic.
 BOOST_AUTO_TEST_CASE(fee_timer_blocking_test)
