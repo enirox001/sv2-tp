@@ -93,6 +93,7 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
         auto predicate = [&] {
             return state->shutdown ||
                    state->wait_interrupt_generation != observed_interrupt_generation ||
+                   state->chain.prev_hash != block.hashPrevBlock ||
                    !state->events.empty();
         };
         if (!state->cv.wait_until(lk, deadline, predicate)) {
@@ -104,15 +105,20 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
         if (state->wait_interrupt_generation != observed_interrupt_generation) {
             return nullptr;
         }
+        if (state->chain.prev_hash != block.hashPrevBlock) {
+            // The tip changed since this template was built. Like the real
+            // waitNext(), every waiter observes this and emits a template for
+            // the new tip, regardless of the fee threshold.
+            auto prev = state->chain.prev_hash;
+            auto txs = state->txs;
+            uint64_t seq = ++state->chain.template_seq;
+            state->chain.last_template_fee_sum = state->chain.pending_fee_sum;
+            return std::make_unique<MockBlockTemplate>(state, prev, std::move(txs), seq, state->chain.pending_fee_sum);
+        }
         if (state->events.empty()) continue; // spurious
         MockEvent ev = state->events.front();
         state->events.pop();
         bool emit = false;
-        if (ev.type == MockEvent::Type::NewTip) {
-            state->chain.height++;
-            state->chain.prev_hash = HashFromHeight(state->chain.height);
-            emit = true; // always emit on new tip
-        }
         if (ev.type == MockEvent::Type::FeeIncrease) {
             // Model fee inflow independently from tx contents so tests can
             // deterministically trigger or suppress fee-threshold templates.
@@ -192,7 +198,8 @@ void MockMining::TriggerFeeIncrease(std::vector<CTransactionRef> txs)
 void MockMining::TriggerNewTip()
 {
     LOCK(state->m);
-    state->events.push(MockEvent{MockEvent::Type::NewTip, {}});
+    state->chain.height++;
+    state->chain.prev_hash = HashFromHeight(state->chain.height);
     state->cv.notify_all();
 }
 void MockMining::Shutdown()

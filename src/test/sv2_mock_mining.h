@@ -21,7 +21,7 @@
 // Minimal mocks for the Mining IPC interface used by sv2 tests.
 
 struct MockEvent {
-    enum class Type { None, FeeIncrease, NewTip };
+    enum class Type { None, FeeIncrease };
     Type type{Type::None};
     std::vector<CTransactionRef> txs; // optional txs on fee increase
 };
@@ -95,6 +95,9 @@ public:
 
     // Test control helpers
     void TriggerFeeIncrease(std::vector<CTransactionRef> txs);
+    //! Advance the chain tip. Like the real node, this is observed by every
+    //! concurrent waitNext() caller, each of which returns a template for the
+    //! new tip.
     void TriggerNewTip();
     void Shutdown();
 
