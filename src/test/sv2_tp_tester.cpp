@@ -107,15 +107,22 @@ TPTester::~TPTester()
     if (m_loop_thread.joinable()) m_loop_thread.join();
 }
 
-void TPTester::SendPeerBytes()
+TPTester::Peer& TPTester::GetPeer(size_t peer_id)
 {
-    const auto& [data, more, _m_message_type] = m_peer_transport->GetBytesToSend(/*have_next_message=*/false);
+    BOOST_REQUIRE(peer_id < m_peers.size());
+    return m_peers[peer_id];
+}
+
+void TPTester::SendPeerBytes(size_t peer_id)
+{
+    Peer& peer{GetPeer(peer_id)};
+    const auto& [data, more, _m_message_type] = peer.transport->GetBytesToSend(/*have_next_message=*/false);
     BOOST_REQUIRE(data.size() > 0);
 
     // Schedule data to be returned by the next Recv() call from
     // Sv2Connman on the socket it has accepted.
-    m_current_client_pipes->recv.PushBytes(data.data(), data.size());
-    m_peer_transport->MarkBytesSent(data.size());
+    peer.pipes->recv.PushBytes(data.data(), data.size());
+    peer.transport->MarkBytesSent(data.size());
 }
 
 /**
@@ -126,63 +133,65 @@ void TPTester::SendPeerBytes()
  *
  * This removes brittleness where a single partial handshake/frame fragment caused an assertion failure.
  */
-size_t TPTester::PeerReceiveBytes()
+size_t TPTester::PeerReceiveBytes(size_t peer_id)
 {
+    Peer& peer{GetPeer(peer_id)};
     // Use shared fragment-tolerant helper for uniform instrumentation across tests.
     size_t consumed_total = 0;
-    size_t total = Sv2TestAccumulateRecv(m_current_client_pipes,
-        [this, &consumed_total](std::span<const uint8_t> frag) {
+    size_t total = Sv2TestAccumulateRecv(peer.pipes,
+        [&peer, &consumed_total](std::span<const uint8_t> frag) {
             const size_t initial = frag.size();
-            bool done = m_peer_transport->ReceivedBytes(frag);
+            bool done = peer.transport->ReceivedBytes(frag);
             const size_t consumed = initial - frag.size();
             consumed_total += consumed;
             if (!frag.empty()) {
-                m_current_client_pipes->send.PushBytes(frag.data(), frag.size());
+                peer.pipes->send.PushBytes(frag.data(), frag.size());
             }
             return done;
         }, std::chrono::milliseconds{2000}, "tp_peer_recv");
     if (total == Sv2HandshakeState::HANDSHAKE_STEP2_SIZE &&
-        m_peer_transport &&
-        m_peer_transport->GetSendState() != Sv2Transport::SendState::READY) {
+        peer.transport &&
+        peer.transport->GetSendState() != Sv2Transport::SendState::READY) {
         BOOST_FAIL("tp_peer_recv: full handshake bytes accumulated (" << total << ") but transport not READY (expected ReadMsgES success)");
     }
 
-    if (m_peer_transport && m_peer_transport->ReceivedMessageComplete()) {
+    if (peer.transport && peer.transport->ReceivedMessageComplete()) {
         bool reject_message = false;
-        m_peer_transport->GetReceivedMessage(std::chrono::microseconds{0}, reject_message);
+        peer.transport->GetReceivedMessage(std::chrono::microseconds{0}, reject_message);
         BOOST_REQUIRE(!reject_message);
     }
     return consumed_total > 0 ? consumed_total : total;
 }
 
-void TPTester::handshake()
+void TPTester::handshake(size_t peer_id)
 {
-    m_peer_transport.reset();
+    if (peer_id >= m_peers.size()) m_peers.resize(peer_id + 1);
+    Peer& peer{m_peers[peer_id]};
 
     auto peer_static_key{GenerateRandomKey()};
-    m_peer_transport = std::make_unique<Sv2Transport>(std::move(peer_static_key), m_tp->m_authority_pubkey);
+    peer.transport = std::make_unique<Sv2Transport>(std::move(peer_static_key), m_tp->m_authority_pubkey);
 
     // Have Sv2Connman's listen socket's Accept() simulate a newly arrived connection.
-    m_current_client_pipes = std::make_shared<DynSock::Pipes>();
+    peer.pipes = std::make_shared<DynSock::Pipes>();
     m_tp_accepted_sockets->Push(
-        std::make_unique<DynSock>(m_current_client_pipes, std::make_shared<DynSock::Queue>()));
+        std::make_unique<DynSock>(peer.pipes, std::make_shared<DynSock::Queue>()));
 
     // Flush transport for handshake part 1
-    SendPeerBytes();
+    SendPeerBytes(peer_id);
 
     // Read handshake part 2 from transport. We no longer assume it arrives as one contiguous read;
     // PeerReceiveBytes will loop until the transport signals completion (READY send state) or timeout.
-    size_t received = PeerReceiveBytes();
+    size_t received = PeerReceiveBytes(peer_id);
     // Handshake step 2 is a fixed-size structure; assert strict equality.
     BOOST_REQUIRE_EQUAL(received, Sv2HandshakeState::HANDSHAKE_STEP2_SIZE);
 }
 
-void TPTester::receiveMessage(Sv2NetMsg& msg)
+void TPTester::receiveMessage(Sv2NetMsg& msg, size_t peer_id)
 {
     // Client encrypts message and puts it on the transport:
     CSerializedNetMsg net_msg{std::move(msg)};
-    BOOST_REQUIRE(m_peer_transport->SetMessageToSend(net_msg));
-    SendPeerBytes();
+    BOOST_REQUIRE(GetPeer(peer_id).transport->SetMessageToSend(net_msg));
+    SendPeerBytes(peer_id);
 }
 
 Sv2NetMsg TPTester::SetupConnectionMsg()
@@ -212,25 +221,25 @@ size_t TPTester::GetBlockTemplateCount()
     return m_tp->GetBlockTemplates().size();
 }
 
-void TPTester::SendSetupConnection()
+void TPTester::SendSetupConnection(size_t peer_id)
 {
     node::Sv2NetMsg setup{SetupConnectionMsg()};
-    receiveMessage(setup);
+    receiveMessage(setup, peer_id);
     // SetupConnection.Success is 6 bytes
-    BOOST_REQUIRE_EQUAL(PeerReceiveBytes(), SV2_HEADER_ENCRYPTED_SIZE + 6 + Poly1305::TAGLEN);
+    BOOST_REQUIRE_EQUAL(PeerReceiveBytes(peer_id), SV2_HEADER_ENCRYPTED_SIZE + 6 + Poly1305::TAGLEN);
 }
 
-void TPTester::SendCoinbaseOutputConstraints()
+void TPTester::SendCoinbaseOutputConstraints(size_t peer_id)
 {
     std::vector<uint8_t> coinbase_output_constraint_bytes{
         0x01, 0x00, 0x00, 0x00, // coinbase_output_max_additional_size
         0x00, 0x00              // coinbase_output_max_sigops
     };
     node::Sv2NetMsg coc_msg{node::Sv2MsgType::COINBASE_OUTPUT_CONSTRAINTS, std::move(coinbase_output_constraint_bytes)};
-    receiveMessage(coc_msg);
+    receiveMessage(coc_msg, peer_id);
 }
 
-size_t TPTester::ReceiveTemplatePair()
+size_t TPTester::ReceiveTemplatePair(size_t peer_id)
 {
     const size_t expected_set_new_prev_hash = SV2_HEADER_ENCRYPTED_SIZE + SV2_SET_NEW_PREV_HASH_MSG_SIZE + Poly1305::TAGLEN;
     const size_t expected_new_template = SV2_HEADER_ENCRYPTED_SIZE + SV2_NEW_TEMPLATE_MSG_SIZE + Poly1305::TAGLEN;
@@ -242,7 +251,7 @@ size_t TPTester::ReceiveTemplatePair()
     int iterations = 0;
 
     while (accumulated < expected_pair_bytes) {
-        size_t chunk = PeerReceiveBytes();
+        size_t chunk = PeerReceiveBytes(peer_id);
         accumulated += chunk;
         ++iterations;
 

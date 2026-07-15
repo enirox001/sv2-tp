@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <thread>
+#include <vector>
 
 // Forward declarations
 class Sv2Transport;
@@ -23,9 +24,16 @@ class MockMining;
 
 class TPTester {
 private:
-    std::unique_ptr<Sv2Transport> m_peer_transport; //!< Transport for peer
+    //! Per-peer connection state. Each simulated client has its own noise
+    //! transport and socket pipes.
+    struct Peer {
+        std::unique_ptr<Sv2Transport> transport;
+        std::shared_ptr<DynSock::Pipes> pipes;
+    };
+    std::vector<Peer> m_peers;
+    Peer& GetPeer(size_t peer_id);
+
     std::shared_ptr<DynSock::Queue> m_tp_accepted_sockets{std::make_shared<DynSock::Queue>()};
-    std::shared_ptr<DynSock::Pipes> m_current_client_pipes;
 
     // IPC loopback components
     std::thread m_loop_thread;
@@ -45,19 +53,20 @@ public:
     explicit TPTester(Sv2TemplateProviderOptions opts);
     ~TPTester();
 
-    void SendPeerBytes();
-    size_t PeerReceiveBytes();
-    void handshake();
-    void receiveMessage(Sv2NetMsg& msg);
+    void SendPeerBytes(size_t peer_id = 0);
+    size_t PeerReceiveBytes(size_t peer_id = 0);
+    /** Connect (or reconnect) peer and perform the noise handshake. */
+    void handshake(size_t peer_id = 0);
+    void receiveMessage(Sv2NetMsg& msg, size_t peer_id = 0);
     Sv2NetMsg SetupConnectionMsg();
     size_t GetBlockTemplateCount();
 
     /** Send SetupConnection and verify Success reply. */
-    void SendSetupConnection();
+    void SendSetupConnection(size_t peer_id = 0);
     /** Send CoinbaseOutputConstraints message. */
-    void SendCoinbaseOutputConstraints();
+    void SendCoinbaseOutputConstraints(size_t peer_id = 0);
     /** Receive a NewTemplate + SetNewPrevHash pair and verify sizes. Returns total bytes. */
-    size_t ReceiveTemplatePair();
+    size_t ReceiveTemplatePair(size_t peer_id = 0);
 
     // SV2 message payload sizes used for test verification
     static constexpr size_t SV2_SET_NEW_PREV_HASH_MSG_SIZE =
