@@ -182,11 +182,11 @@ bool MockMining::WaitForTemplateSeq(uint64_t target, std::chrono::milliseconds t
     return state->cv.wait_until(lk, deadline, [&]{ return state->shutdown || state->chain.template_seq >= target; }) && !state->shutdown && state->chain.template_seq >= target;
 }
 
-bool MockMining::WaitForWaitNext(std::chrono::milliseconds timeout)
+bool MockMining::WaitForWaitNext(int min_waiters, std::chrono::milliseconds timeout)
 {
     std::unique_lock<Mutex> lk(state->m);
     auto deadline = std::chrono::steady_clock::now() + timeout;
-    return state->cv.wait_until(lk, deadline, [&]{ return state->shutdown || state->wait_next_waiters > 0; }) && !state->shutdown && state->wait_next_waiters > 0;
+    return state->cv.wait_until(lk, deadline, [&]{ return state->shutdown || state->wait_next_waiters >= min_waiters; }) && !state->shutdown && state->wait_next_waiters >= min_waiters;
 }
 
 void MockMining::TriggerFeeIncrease(std::vector<CTransactionRef> txs)

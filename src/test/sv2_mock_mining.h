@@ -103,7 +103,8 @@ public:
 
     // Wait until internal template sequence reaches at least target (returns false on timeout/shutdown)
     bool WaitForTemplateSeq(uint64_t target, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
-    bool WaitForWaitNext(std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
+    // Wait until at least min_waiters threads are blocked in waitNext (returns false on timeout/shutdown)
+    bool WaitForWaitNext(int min_waiters = 1, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
 
 private:
     std::shared_ptr<MockState> state;
