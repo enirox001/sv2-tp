@@ -395,6 +395,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
 
         std::shared_ptr<BlockTemplate> block_template;
         std::shared_ptr<BackendSession> backend;
+        std::shared_ptr<BackendSession> template_backend;
         // Cache most recent block_template->getBlockHeader().hashPrevBlock result.
         uint256 prev_hash;
 
@@ -409,7 +410,13 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
             if (backend->Disconnected()) {
                 backend.reset();
                 block_template.reset();
+                template_backend.reset();
                 continue;
+            }
+
+            if (template_backend && template_backend != backend) {
+                block_template.reset();
+                template_backend.reset();
             }
 
             if (!block_template) {
@@ -426,12 +433,20 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 if (!prepare_block_create_options(block_create_options)) break;
 
                 const auto time_start{SteadyClock::now()};
-                block_template = backend->Mining().createNewBlock(block_create_options);
+                try {
+                    block_template = backend->Mining().createNewBlock(block_create_options);
+                } catch (const ipc::Exception& e) {
+                    DisconnectBackend(backend, "createNewBlock", e);
+                    backend.reset();
+                    continue;
+                }
                 if (!block_template) {
                     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "No new template for client id=%zu, node is shutting down\n",
                         client_id);
                     break;
                 }
+                template_backend = backend;
+
                 {
                     LOCK(m_connman->m_clients_mutex);
                     std::shared_ptr client = m_connman->GetClientById(client_id);
@@ -444,7 +459,13 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Assemble template: %.2fms\n",
                     Ticks<MillisecondsDouble>(SteadyClock::now() - time_start));
 
-                prev_hash = block_template->getBlockHeader().hashPrevBlock;
+                try {
+                    prev_hash = block_template->getBlockHeader().hashPrevBlock;
+                } catch (const ipc::Exception& e) {
+                    DisconnectBackend(backend, "getBlockHeader", e);
+                    backend.reset();
+                    continue;
+                }
                 {
                     LOCK(m_tp_mutex);
                     if (prev_hash != m_best_prev_hash) {
@@ -467,11 +488,17 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                         block_template = nullptr;
                         continue;
                     }
-                    if (!SendWork(*client, template_id, *block_template, /*future_template=*/true)) {
-                        LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Disconnecting client id=%zu\n",
-                                    client_id);
-                        LOCK(client->cs_status);
-                        client->m_disconnect_flag = true;
+                    try {
+                        if (!SendWork(*client, template_id, *block_template, /*future_template=*/true)) {
+                            LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Disconnecting client id=%zu\n",
+                                        client_id);
+                            LOCK(client->cs_status);
+                            client->m_disconnect_flag = true;
+                        }
+                    } catch (const ipc::Exception& e) {
+                        DisconnectBackend(backend, "SendWork", e);
+                        backend.reset();
+                        continue;
                     }
                 }
 
@@ -505,7 +532,16 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                               client_id);
             }
 
-            std::shared_ptr<BlockTemplate> tmpl = block_template->waitNext(options);
+            std::shared_ptr<BlockTemplate> tmpl;
+            try {
+                tmpl = block_template->waitNext(options);
+            } catch (const ipc::Exception& e) {
+                DisconnectBackend(template_backend, "template provider client loop", e);
+                backend.reset();
+                block_template.reset();
+                template_backend.reset();
+                continue;
+            }
             // The client may have disconnected during the wait, check now to avoid
             // a spurious IPC call and confusing log statements.
             {
@@ -521,7 +557,17 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
             // After timeout and during node shutdown this is expect to not be set
             if (tmpl) {
                 block_template = tmpl;
-                uint256 new_prev_hash{block_template->getBlockHeader().hashPrevBlock};
+                template_backend = backend;
+                uint256 new_prev_hash;
+                try {
+                    new_prev_hash = block_template->getBlockHeader().hashPrevBlock;
+                } catch (const ipc::Exception& e) {
+                    DisconnectBackend(template_backend, "getBlockHeader", e);
+                    backend.reset();
+                    block_template.reset();
+                    template_backend.reset();
+                    continue;
+                }
 
                 // Compare against the handler-local prev_hash, not the shared
                 // m_best_prev_hash: another client handler may have already
@@ -565,11 +611,19 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                         block_template = nullptr;
                         continue;
                     }
-                    if (!SendWork(*client, WITH_LOCK(m_tp_mutex, return m_template_id;), *block_template, future_template)) {
-                        LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Disconnecting client id=%zu\n",
-                                    client_id);
-                        LOCK(client->cs_status);
-                        client->m_disconnect_flag = true;
+                    try {
+                        if (!SendWork(*client, WITH_LOCK(m_tp_mutex, return m_template_id;), *block_template, future_template)) {
+                            LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Disconnecting client id=%zu\n",
+                                        client_id);
+                            LOCK(client->cs_status);
+                            client->m_disconnect_flag = true;
+                        }
+                    } catch (const ipc::Exception& e) {
+                        DisconnectBackend(template_backend, "SendWork", e);
+                        backend.reset();
+                        block_template.reset();
+                        template_backend.reset();
+                        continue;
                     }
                 }
 
@@ -598,6 +652,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
 void Sv2TemplateProvider::RequestTransactionData(Sv2Client& client, node::Sv2RequestTransactionDataMsg msg)
 {
     CBlock block;
+    std::shared_ptr<BlockTemplate> block_template;
     {
         LOCK(m_tp_mutex);
         auto cached_block = m_block_template_cache.find(msg.m_template_id);
@@ -611,8 +666,22 @@ void Sv2TemplateProvider::RequestTransactionData(Sv2Client& client, node::Sv2Req
 
             return;
         }
-        block = (*cached_block->second.second).getBlock();
+        block_template = cached_block->second.second;
+    }
+    try {
+        block = block_template->getBlock();
+    } catch (const ipc::Exception& e) {
+        std::shared_ptr<BackendSession> backend;
+        {
+            LOCK(m_backend_mutex);
+            backend = m_backend;
+        }
+        DisconnectBackend(backend, "getBlock", e);
+        return;
+    }
 
+    {
+        LOCK(m_tp_mutex);
         auto recent = GetTime<std::chrono::seconds>() - std::chrono::seconds(STALE_TEMPLATE_GRACE_PERIOD);
         if (block.hashPrevBlock != m_best_prev_hash && m_last_block_time < recent) {
             LogTrace(BCLog::SV2, "Template id=%lu prevhash=%s, tip=%s\n", msg.m_template_id, HexStr(block.hashPrevBlock), HexStr(m_best_prev_hash));
@@ -687,11 +756,22 @@ void Sv2TemplateProvider::SubmitSolution(node::Sv2SubmitSolutionMsg solution)
         }
 
         // Submit the solution to construct and process the block
-        const bool submitted = block_template->submitSolution(
-            solution.m_version,
-            solution.m_header_timestamp,
-            solution.m_header_nonce,
-            MakeTransactionRef(solution.m_coinbase_tx));
+        bool submitted{false};
+        try {
+            submitted = block_template->submitSolution(
+                solution.m_version,
+                solution.m_header_timestamp,
+                solution.m_header_nonce,
+                MakeTransactionRef(solution.m_coinbase_tx));
+        } catch (const ipc::Exception& e) {
+            std::shared_ptr<BackendSession> backend;
+            {
+                LOCK(m_backend_mutex);
+                backend = m_backend;
+            }
+            DisconnectBackend(backend, "submitSolution", e);
+            return;
+        }
 
         SaveBlockAsync(block_template, submitted);
 }
