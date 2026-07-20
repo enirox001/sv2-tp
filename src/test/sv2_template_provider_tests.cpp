@@ -51,6 +51,26 @@ BOOST_AUTO_TEST_CASE(ibd_check_once_per_backend)
     BOOST_REQUIRE_EQUAL(tester.m_mining_control->GetInitialBlockDownloadChecks(), checks);
 }
 
+BOOST_AUTO_TEST_CASE(wait_next_null_backoff)
+{
+    Sv2TemplateProviderOptions opts;
+    opts.is_test = false;
+    opts.template_interval = std::chrono::seconds{1};
+    TPTester tester{opts};
+
+    // A null waitNext() result should not spin the client handler. The retry
+    // backoff keeps repeated empty results from flooding the backend.
+    tester.m_mining_control->SetWaitNextReturnsNull(true);
+    tester.handshake();
+    tester.SendSetupConnection();
+    tester.SendCoinbaseOutputConstraints();
+    tester.ReceiveTemplatePair();
+
+    BOOST_REQUIRE(tester.m_mining_control->WaitForWaitNextCalls(1));
+    UninterruptibleSleep(std::chrono::milliseconds{350});
+    BOOST_REQUIRE_LE(tester.m_mining_control->GetWaitNextCalls(), 3);
+}
+
 BOOST_AUTO_TEST_CASE(resume_after_backend_reconnect)
 {
     TPTester tester{};

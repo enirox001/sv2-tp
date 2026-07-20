@@ -88,10 +88,13 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
         MockState& m_state;
     } waiter{*state};
 
+    ++state->wait_next_calls;
+    state->cv.notify_all();
     const uint64_t observed_interrupt_generation{state->wait_interrupt_generation};
     while (true) {
         auto predicate = [&] {
             return state->shutdown ||
+                   state->return_null_wait_next ||
                    state->wait_interrupt_generation != observed_interrupt_generation ||
                    state->chain.prev_hash != block.hashPrevBlock ||
                    !state->events.empty();
@@ -100,6 +103,9 @@ std::unique_ptr<interfaces::BlockTemplate> MockBlockTemplate::waitNext(node::Blo
             return nullptr; // timeout
         }
         if (state->shutdown) {
+            return nullptr;
+        }
+        if (state->return_null_wait_next) {
             return nullptr;
         }
         if (state->wait_interrupt_generation != observed_interrupt_generation) {
@@ -175,6 +181,12 @@ uint64_t MockMining::GetInitialBlockDownloadChecks()
     return state->initial_block_download_checks;
 }
 
+uint64_t MockMining::GetWaitNextCalls()
+{
+    LOCK(state->m);
+    return state->wait_next_calls;
+}
+
 uint64_t MockMining::GetTemplateSeq()
 {
     LOCK(state->m);
@@ -203,6 +215,15 @@ bool MockMining::WaitForInitialBlockDownloadChecks(uint64_t target, std::chrono:
     }) && !state->shutdown && state->initial_block_download_checks >= target;
 }
 
+bool MockMining::WaitForWaitNextCalls(uint64_t target, std::chrono::milliseconds timeout)
+{
+    std::unique_lock<Mutex> lk(state->m);
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    return state->cv.wait_until(lk, deadline, [&] {
+        return state->shutdown || state->wait_next_calls >= target;
+    }) && !state->shutdown && state->wait_next_calls >= target;
+}
+
 bool MockMining::WaitForWaitNext(int min_waiters, std::chrono::milliseconds timeout)
 {
     std::unique_lock<Mutex> lk(state->m);
@@ -221,6 +242,12 @@ void MockMining::TriggerNewTip()
     LOCK(state->m);
     state->chain.height++;
     state->chain.prev_hash = HashFromHeight(state->chain.height);
+    state->cv.notify_all();
+}
+void MockMining::SetWaitNextReturnsNull(bool value)
+{
+    LOCK(state->m);
+    state->return_null_wait_next = value;
     state->cv.notify_all();
 }
 void MockMining::Shutdown()

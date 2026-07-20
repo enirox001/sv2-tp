@@ -46,7 +46,9 @@ struct MockState {
     std::queue<MockEvent> events;    // queued events driving waitNext()
     std::condition_variable_any cv;
     int wait_next_waiters{0};
+    uint64_t wait_next_calls{0};
     uint64_t initial_block_download_checks{0};
+    bool return_null_wait_next{false};
     bool shutdown{false};
     uint64_t wait_interrupt_generation{0};
 };
@@ -92,6 +94,7 @@ public:
 
     // Accessors for tests (thread-safe)
     uint64_t GetInitialBlockDownloadChecks();
+    uint64_t GetWaitNextCalls();
     uint64_t GetTemplateSeq();
     uint64_t GetHeight();
 
@@ -101,10 +104,12 @@ public:
     //! concurrent waitNext() caller, each of which returns a template for the
     //! new tip.
     void TriggerNewTip();
+    void SetWaitNextReturnsNull(bool value);
     void Shutdown();
 
     // Wait until internal template sequence reaches at least target (returns false on timeout/shutdown)
     bool WaitForInitialBlockDownloadChecks(uint64_t target, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
+    bool WaitForWaitNextCalls(uint64_t target, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
     bool WaitForTemplateSeq(uint64_t target, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});
     // Wait until at least min_waiters threads are blocked in waitNext (returns false on timeout/shutdown)
     bool WaitForWaitNext(int min_waiters = 1, std::chrono::milliseconds timeout = std::chrono::milliseconds{2000});

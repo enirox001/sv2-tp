@@ -21,6 +21,10 @@
 #include <limits>
 
 namespace {
+
+constexpr auto WAIT_NEXT_RETRY_INITIAL_DELAY{100ms};
+constexpr auto WAIT_NEXT_RETRY_MAX_DELAY{1000ms};
+
 // Keep probing the backend even when no client handler is making template IPC calls.
 constexpr auto BACKEND_LIVENESS_CHECK_INTERVAL{1000ms};
 }
@@ -389,6 +393,8 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
 {
     try {
         Timer timer(m_options.template_interval);
+        auto wait_next_retry_delay{WAIT_NEXT_RETRY_INITIAL_DELAY};
+
         const auto prepare_block_create_options = [this, client_id](node::BlockCreateOptions& options) -> bool {
             {
                 LOCK(m_connman->m_clients_mutex);
@@ -522,6 +528,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 }
 
                 timer.reset();
+                wait_next_retry_delay = WAIT_NEXT_RETRY_INITIAL_DELAY;
             }
 
             // The future template flag is set when there's a new prevhash,
@@ -573,7 +580,15 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 } else break;
             }
 
-            // After timeout and during node shutdown this is expect to not be set
+            // After timeout and during node shutdown this is expected to not be set.
+            // Back off when shutdown causes waitNext() to return immediately, to
+            // avoid repeatedly calling into a backend that is going away.
+            if (!tmpl) {
+                if (!m_interrupt_sv2.sleep_for(wait_next_retry_delay)) break;
+                wait_next_retry_delay = std::min(wait_next_retry_delay * 2, WAIT_NEXT_RETRY_MAX_DELAY);
+                continue;
+            }
+
             if (tmpl) {
                 block_template = tmpl;
                 template_backend = backend;
@@ -647,6 +662,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 }
 
                 timer.reset();
+                wait_next_retry_delay = WAIT_NEXT_RETRY_INITIAL_DELAY;
             }
 
             if (m_options.is_test) {
