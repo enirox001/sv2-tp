@@ -285,7 +285,11 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "%s block template for client id=%zu\n", constraints_generation_at_build == 0 ? "Generate initial" : "Regenerate", client_id);
 
                 // Create block template and store interface reference
-                uint64_t template_id{WITH_LOCK(m_tp_mutex, return ++m_template_id;)};
+                uint64_t template_id;
+                {
+                    LOCK(m_tp_mutex);
+                    template_id = ++m_template_id;
+                }
 
                 node::BlockCreateOptions block_create_options{.use_mempool = true};
                 if (!prepare_block_create_options(block_create_options)) break;
