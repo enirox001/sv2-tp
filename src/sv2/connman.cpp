@@ -19,6 +19,7 @@ Sv2Connman::~Sv2Connman()
         for (const auto& client : m_sv2_clients) {
             LogTrace(BCLog::SV2, "Disconnecting client id=%zu\n",
                     client.first);
+            LOCK(client.second->cs_status);
             client.second->m_disconnect_flag = true;
         }
         DisconnectFlagged();
