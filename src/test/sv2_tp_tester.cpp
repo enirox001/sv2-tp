@@ -6,6 +6,7 @@
 
 #include <boost/test/unit_test.hpp>
 #include <interfaces/init.h>
+#include <ipc/exception.h>
 #include <mp/proxy-io.h>
 #include <src/ipc/capnp/init.capnp.h>
 #include <src/ipc/capnp/init.capnp.proxy.h>
@@ -44,8 +45,9 @@ TPTester::TPTester(Sv2TemplateProviderOptions opts)
     // Start cap'n proto event loop on a background thread
     std::promise<mp::EventLoop*> loop_ready;
     m_loop_thread = std::thread([&] {
-        auto log_fn = [](bool /*raise*/, std::string message) {
+        auto log_fn = [](bool raise, std::string message) {
             if (G_TEST_LOG_FUN) G_TEST_LOG_FUN(message);
+            if (raise) throw ipc::Exception(message);
         };
         mp::EventLoop loop("sv2-tp-test", log_fn);
         m_loop = &loop;

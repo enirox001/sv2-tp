@@ -59,9 +59,13 @@ private:
         BackendSession(std::unique_ptr<interfaces::Init> init, std::unique_ptr<interfaces::Mining> mining) :
             m_init(std::move(init)), m_mining(std::move(mining)) {}
 
+        /** Returns true only for the first caller marking this generation disconnected. */
+        bool MarkDisconnected() { return !m_disconnected.exchange(true); }
+        bool Disconnected() const { return m_disconnected.load(); }
         interfaces::Mining& Mining() { return *m_mining; }
 
     private:
+        std::atomic<bool> m_disconnected{false};
         // Keep init alive for as long as proxies from this generation may be used.
         std::unique_ptr<interfaces::Init> m_init;
         std::unique_ptr<interfaces::Mining> m_mining;
@@ -218,6 +222,17 @@ private:
      * account, we set future_template to false and don't send SetNewPrevHash.
      */
     [[nodiscard]] bool SendWork(Sv2Client& client, uint64_t template_id, BlockTemplate& block_template, bool future_template);
+
+    /**
+     * Drop templates held for the current backend generation.
+     */
+    void ClearTemplateCache(bool log_dropped_templates) EXCLUSIVE_LOCKS_REQUIRED(m_tp_mutex);
+
+    /**
+     * Mark a backend session disconnected and clear state held for it.
+     */
+    void DisconnectBackend(const std::shared_ptr<BackendSession>& backend, const char* operation, const std::exception& exception)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex, !m_tp_mutex);
 
     /**
      * Interrupt template waits on the active backend session.

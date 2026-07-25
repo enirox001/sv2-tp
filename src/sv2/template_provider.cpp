@@ -29,6 +29,11 @@ void Sv2TemplateProvider::ReplaceBackend(std::unique_ptr<interfaces::Init> node_
     auto backend = std::make_shared<BackendSession>(std::move(node_init), std::move(mining));
     {
         LOCK(m_backend_mutex);
+        LOCK(m_tp_mutex);
+
+        // Cached templates belong to a specific IPC backend generation. Drop
+        // old proxies before publishing the replacement backend.
+        ClearTemplateCache(/*log_dropped_templates=*/true);
         m_backend = backend;
     }
 }
@@ -37,6 +42,39 @@ bool Sv2TemplateProvider::BackendConnected()
 {
     LOCK(m_backend_mutex);
     return m_backend != nullptr;
+}
+
+void Sv2TemplateProvider::DisconnectBackend(const std::shared_ptr<BackendSession>& backend,
+                                            const char* operation,
+                                            const std::exception& exception)
+{
+    if (!backend) return;
+
+    // Multiple client threads can observe the same backend failure. Only the
+    // first one should clear state and log the disconnect at error level.
+    const bool first_disconnect = backend->MarkDisconnected();
+    std::shared_ptr<BackendSession> active_backend;
+    {
+        LOCK(m_backend_mutex);
+        if (m_backend == backend) {
+            active_backend = m_backend;
+            LOCK(m_tp_mutex);
+            ClearTemplateCache(/*log_dropped_templates=*/true);
+            m_backend.reset();
+        }
+    }
+    if (!active_backend) return;
+
+    if (first_disconnect) {
+        LogPrintLevel(BCLog::SV2, BCLog::Level::Error,
+                      "Bitcoin Core IPC connection lost during %s: %s\n",
+                      operation, exception.what());
+    } else {
+        LogPrintLevel(BCLog::SV2, BCLog::Level::Trace,
+                      "Ignoring repeated Bitcoin Core IPC failure during %s: %s\n",
+                      operation, exception.what());
+    }
+
 }
 
 void Sv2TemplateProvider::InterruptBackend()
@@ -56,9 +94,17 @@ void Sv2TemplateProvider::InterruptBackend()
         }
     }
     for (const auto& block_template : templates) {
-        block_template->interruptWait();
+        try {
+            block_template->interruptWait();
+        } catch (const ipc::Exception& e) {
+            DisconnectBackend(backend, "interruptWait", e);
+        }
     }
-    backend->Mining().interrupt();
+    try {
+        backend->Mining().interrupt();
+    } catch (const ipc::Exception& e) {
+        DisconnectBackend(backend, "interrupt", e);
+    }
 }
 
 Sv2TemplateProvider::Sv2TemplateProvider()
@@ -163,7 +209,14 @@ Sv2TemplateProvider::~Sv2TemplateProvider()
     StopThreads();
     {
         LOCK(m_backend_mutex);
-        m_backend.reset();
+        if (m_backend) {
+            m_backend->MarkDisconnected();
+            m_backend.reset();
+        }
+    }
+    {
+        LOCK(m_tp_mutex);
+        ClearTemplateCache(/*log_dropped_templates=*/false);
     }
 }
 
@@ -212,6 +265,19 @@ public:
     }
 };
 
+void Sv2TemplateProvider::ClearTemplateCache(bool log_dropped_templates)
+{
+    AssertLockHeld(m_tp_mutex);
+    if (log_dropped_templates && !m_block_template_cache.empty()) {
+        LogPrintLevel(BCLog::SV2, BCLog::Level::Warning,
+                      "Dropping %zu cached block templates after Bitcoin Core IPC backend reset\n",
+                      m_block_template_cache.size());
+    }
+    m_block_template_cache.clear();
+    m_best_prev_hash = uint256::ZERO;
+    m_last_block_time = GetTime<std::chrono::seconds>();
+}
+
 void Sv2TemplateProvider::ThreadSv2Handler()
 {
     // Make sure it's initialized, doesn't need to be accurate.
@@ -246,9 +312,9 @@ void Sv2TemplateProvider::ThreadSv2Handler()
     std::map<size_t, std::thread> client_threads;
 
     while (!m_flag_interrupt_sv2) {
+
         // We start with one template per client, which has an interface through
         // which we monitor for better templates.
-
         m_connman->ForEachClient([this, &client_threads](Sv2Client& client) {
             /**
              * The initial handshake is handled on the Sv2Connman thread. This
@@ -282,15 +348,12 @@ void Sv2TemplateProvider::ThreadSv2Handler()
             thread.second.join();
         }
     }
-
-
 }
 
 void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
 {
     try {
         Timer timer(m_options.template_interval);
-
         const auto prepare_block_create_options = [this, client_id](node::BlockCreateOptions& options) -> bool {
             {
                 LOCK(m_connman->m_clients_mutex);
@@ -346,7 +409,6 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                         client_id);
                     break;
                 }
-
                 {
                     LOCK(m_connman->m_clients_mutex);
                     std::shared_ptr client = m_connman->GetClientById(client_id);
@@ -480,7 +542,6 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                         block_template = nullptr;
                         continue;
                     }
-
                     if (!SendWork(*client, WITH_LOCK(m_tp_mutex, return m_template_id;), *block_template, future_template)) {
                         LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Disconnecting client id=%zu\n",
                                     client_id);
@@ -497,7 +558,6 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 std::this_thread::sleep_for(50ms);
             }
         }
-
         {
             LOCK(m_connman->m_clients_mutex);
             if (std::shared_ptr client = m_connman->GetClientById(client_id)) {
