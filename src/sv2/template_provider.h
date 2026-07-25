@@ -13,6 +13,7 @@
 #include <streams.h>
 #include <memory>
 #include <atomic>
+#include <condition_variable>
 
 using interfaces::BlockTemplate;
 
@@ -105,6 +106,11 @@ private:
      * Mutex guarding the active backend session.
      */
     Mutex m_backend_mutex;
+
+    /**
+     * Condition variable notified when the active backend session changes.
+     */
+    std::condition_variable_any m_backend_cv;
 
     /**
      * The active backend session.
@@ -227,6 +233,11 @@ private:
      * Drop templates held for the current backend generation.
      */
     void ClearTemplateCache(bool log_dropped_templates) EXCLUSIVE_LOCKS_REQUIRED(m_tp_mutex);
+
+    /**
+     * Wait for an active backend session.
+     */
+    std::shared_ptr<BackendSession> WaitForBackend() EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex);
 
     /**
      * Mark a backend session disconnected and clear state held for it.

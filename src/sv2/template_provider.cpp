@@ -36,12 +36,23 @@ void Sv2TemplateProvider::ReplaceBackend(std::unique_ptr<interfaces::Init> node_
         ClearTemplateCache(/*log_dropped_templates=*/true);
         m_backend = backend;
     }
+    m_backend_cv.notify_all();
 }
 
 bool Sv2TemplateProvider::BackendConnected()
 {
     LOCK(m_backend_mutex);
     return m_backend != nullptr;
+}
+
+std::shared_ptr<Sv2TemplateProvider::BackendSession> Sv2TemplateProvider::WaitForBackend()
+{
+    WAIT_LOCK(m_backend_mutex, lock);
+    while (!m_flag_interrupt_sv2 && !m_backend) {
+        m_backend_cv.wait(lock);
+    }
+    if (m_flag_interrupt_sv2) return nullptr;
+    return m_backend;
 }
 
 void Sv2TemplateProvider::DisconnectBackend(const std::shared_ptr<BackendSession>& backend,
@@ -75,6 +86,7 @@ void Sv2TemplateProvider::DisconnectBackend(const std::shared_ptr<BackendSession
                       operation, exception.what());
     }
 
+    m_backend_cv.notify_all();
 }
 
 void Sv2TemplateProvider::InterruptBackend()
@@ -218,6 +230,7 @@ Sv2TemplateProvider::~Sv2TemplateProvider()
         LOCK(m_tp_mutex);
         ClearTemplateCache(/*log_dropped_templates=*/false);
     }
+    m_backend_cv.notify_all();
 }
 
 void Sv2TemplateProvider::Interrupt()
@@ -227,6 +240,8 @@ void Sv2TemplateProvider::Interrupt()
     m_flag_interrupt_sv2 = true;
 
     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Interrupt pending mining waits...");
+    m_interrupt_sv2();
+    m_backend_cv.notify_all();
     InterruptBackend();
 
     // Also interrupt network threads so client handlers can wind down quickly.
@@ -286,32 +301,32 @@ void Sv2TemplateProvider::ThreadSv2Handler()
         m_last_block_time = GetTime<std::chrono::seconds>();
     }
 
-    std::shared_ptr<BackendSession> backend;
-    {
-        LOCK(m_backend_mutex);
-        backend = m_backend;
-    }
-
-    // Wait to come out of IBD, except on signet, where we might be the only miner.
-    size_t log_ibd{0};
-    while (!m_flag_interrupt_sv2 && gArgs.GetChainType() != ChainType::SIGNET) {
-        // TODO: Wait until there's no headers-only branch with more work than our chaintip.
-        //       The current check can still cause us to broadcast a few dozen useless templates
-        //       at startup.
-        if (!backend->Mining().isInitialBlockDownload()) break;
-        if (log_ibd == 0) {
-            LogPrintf("Waiting for IBD to complete on %s network before serving templates (this may take a while)\n",
-                      ChainTypeToString(gArgs.GetChainType()));
-        } else if (log_ibd % 10 == 0) {
-            LogPrintf(".\n");
-        }
-        log_ibd++;
-        std::this_thread::sleep_for(1000ms);
-    }
-
     std::map<size_t, std::thread> client_threads;
+    std::shared_ptr<BackendSession> checked_ibd_backend;
 
     while (!m_flag_interrupt_sv2) {
+        std::shared_ptr<BackendSession> backend;
+        {
+            LOCK(m_backend_mutex);
+            backend = m_backend;
+        }
+
+        // Wait to come out of IBD, except on signet, where we might be the only miner.
+        if (backend != checked_ibd_backend && gArgs.GetChainType() != ChainType::SIGNET) {
+            try {
+                // TODO: Wait until there's no headers-only branch with more work than our chaintip.
+                //       The current check can still cause us to broadcast a few dozen useless templates
+                //       at startup.
+                if (backend && backend->Mining().isInitialBlockDownload()) {
+                    std::this_thread::sleep_for(1000ms);
+                    continue;
+                }
+            } catch (const ipc::Exception& e) {
+                DisconnectBackend(backend, "template provider main loop", e);
+                continue;
+            }
+            checked_ibd_backend = backend;
+        }
 
         // We start with one template per client, which has an interface through
         // which we monitor for better templates.
@@ -379,16 +394,23 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
 
         std::shared_ptr<BlockTemplate> block_template;
         std::shared_ptr<BackendSession> backend;
-        {
-            LOCK(m_backend_mutex);
-            backend = m_backend;
-        }
         // Cache most recent block_template->getBlockHeader().hashPrevBlock result.
         uint256 prev_hash;
 
         // Track the coinbase constraints generation that was active when block_template was built.
         uint64_t constraints_generation_at_build = 0;
         while (!m_flag_interrupt_sv2) {
+            if (!backend) {
+                backend = WaitForBackend();
+                if (!backend) break;
+            }
+
+            if (backend->Disconnected()) {
+                backend.reset();
+                block_template.reset();
+                continue;
+            }
+
             if (!block_template) {
                 LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "%s block template for client id=%zu\n", constraints_generation_at_build == 0 ? "Generate initial" : "Regenerate", client_id);
 
