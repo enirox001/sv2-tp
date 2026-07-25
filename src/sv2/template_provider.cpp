@@ -23,9 +23,45 @@
 // Allow a few seconds for clients to submit a block or to request transactions
 constexpr size_t STALE_TEMPLATE_GRACE_PERIOD{10};
 
-Sv2TemplateProvider::Sv2TemplateProvider(std::unique_ptr<interfaces::Init> node_init,
+void Sv2TemplateProvider::ReplaceBackend(std::unique_ptr<interfaces::Init> node_init,
                                          std::unique_ptr<interfaces::Mining> mining)
-    : m_backend{std::make_shared<BackendSession>(std::move(node_init), std::move(mining))}
+{
+    auto backend = std::make_shared<BackendSession>(std::move(node_init), std::move(mining));
+    {
+        LOCK(m_backend_mutex);
+        m_backend = backend;
+    }
+}
+
+bool Sv2TemplateProvider::BackendConnected()
+{
+    LOCK(m_backend_mutex);
+    return m_backend != nullptr;
+}
+
+void Sv2TemplateProvider::InterruptBackend()
+{
+    std::shared_ptr<BackendSession> backend;
+    {
+        LOCK(m_backend_mutex);
+        backend = m_backend;
+    }
+    if (!backend) return;
+
+    std::vector<std::shared_ptr<BlockTemplate>> templates;
+    {
+        LOCK(m_tp_mutex);
+        for (auto& t : GetBlockTemplates()) {
+            templates.push_back(t.second.second);
+        }
+    }
+    for (const auto& block_template : templates) {
+        block_template->interruptWait();
+    }
+    backend->Mining().interrupt();
+}
+
+Sv2TemplateProvider::Sv2TemplateProvider()
 {
     // TODO: persist static key
     CKey static_key;
@@ -122,11 +158,13 @@ Sv2TemplateProvider::~Sv2TemplateProvider()
 {
     AssertLockNotHeld(m_tp_mutex);
 
-    m_connman->Interrupt();
-    m_connman->StopThreads();
-
     Interrupt();
+    m_connman->StopThreads();
     StopThreads();
+    {
+        LOCK(m_backend_mutex);
+        m_backend.reset();
+    }
 }
 
 void Sv2TemplateProvider::Interrupt()
@@ -136,14 +174,8 @@ void Sv2TemplateProvider::Interrupt()
     m_flag_interrupt_sv2 = true;
 
     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Interrupt pending mining waits...");
-    {
-        LOCK(m_tp_mutex);
-        for (auto& t : GetBlockTemplates()) {
-            t.second.second->interruptWait();
-        }
-    }
+    InterruptBackend();
 
-    m_backend->Mining().interrupt();
     // Also interrupt network threads so client handlers can wind down quickly.
     if (m_connman) m_connman->Interrupt();
 }
@@ -188,13 +220,19 @@ void Sv2TemplateProvider::ThreadSv2Handler()
         m_last_block_time = GetTime<std::chrono::seconds>();
     }
 
+    std::shared_ptr<BackendSession> backend;
+    {
+        LOCK(m_backend_mutex);
+        backend = m_backend;
+    }
+
     // Wait to come out of IBD, except on signet, where we might be the only miner.
     size_t log_ibd{0};
     while (!m_flag_interrupt_sv2 && gArgs.GetChainType() != ChainType::SIGNET) {
         // TODO: Wait until there's no headers-only branch with more work than our chaintip.
         //       The current check can still cause us to broadcast a few dozen useless templates
         //       at startup.
-        if (!m_backend->Mining().isInitialBlockDownload()) break;
+        if (!backend->Mining().isInitialBlockDownload()) break;
         if (log_ibd == 0) {
             LogPrintf("Waiting for IBD to complete on %s network before serving templates (this may take a while)\n",
                       ChainTypeToString(gArgs.GetChainType()));
@@ -277,7 +315,11 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
         };
 
         std::shared_ptr<BlockTemplate> block_template;
-        const std::shared_ptr<BackendSession> backend{m_backend};
+        std::shared_ptr<BackendSession> backend;
+        {
+            LOCK(m_backend_mutex);
+            backend = m_backend;
+        }
         // Cache most recent block_template->getBlockHeader().hashPrevBlock result.
         uint256 prev_hash;
 

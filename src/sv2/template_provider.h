@@ -97,8 +97,15 @@ private:
     std::atomic<bool> m_flag_interrupt_sv2{false};
     CThreadInterrupt m_interrupt_sv2;
 
-    /** The Bitcoin Core IPC connection and its associated interfaces. */
-    std::shared_ptr<BackendSession> m_backend;
+    /**
+     * Mutex guarding the active backend session.
+     */
+    Mutex m_backend_mutex;
+
+    /**
+     * The active backend session.
+     */
+    std::shared_ptr<BackendSession> m_backend GUARDED_BY(m_backend_mutex);
 
     /**
      * The most recent template id. This is incremented on creating new template,
@@ -124,10 +131,9 @@ private:
     BlockTemplateCache m_block_template_cache GUARDED_BY(m_tp_mutex);
 
 public:
-    Sv2TemplateProvider(std::unique_ptr<interfaces::Init> node_init,
-                        std::unique_ptr<interfaces::Mining> mining);
+    Sv2TemplateProvider();
 
-    ~Sv2TemplateProvider() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+    ~Sv2TemplateProvider() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex, !m_backend_mutex);
 
     Mutex m_tp_mutex;
 
@@ -138,10 +144,21 @@ public:
     [[nodiscard]] bool Start(const Sv2TemplateProviderOptions& options = {});
 
     /**
+     * Whether there is a connected backend session.
+     */
+    bool BackendConnected() EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex);
+
+    /**
+     * Replace the active backend session.
+     */
+    void ReplaceBackend(std::unique_ptr<interfaces::Init> node_init,
+                        std::unique_ptr<interfaces::Mining> mining) EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex, !m_tp_mutex);
+
+    /**
      * The main thread for the template provider, contains an event loop handling
      * all tasks for the template provider.
      */
-    void ThreadSv2Handler() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+    void ThreadSv2Handler() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex, !m_backend_mutex);
 
     /**
      * Give each client its own thread so they're treated equally
@@ -153,13 +170,13 @@ public:
      * connection. For the use case of a public facing template provider,
      * further changes are needed anyway e.g. for DoS resistance.
      */
-    void ThreadSv2ClientHandler(size_t client_id) EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+    void ThreadSv2ClientHandler(size_t client_id) EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex, !m_backend_mutex);
 
     /**
      * Triggered on interrupt signals to stop the main event loop in ThreadSv2Handler().
      * Interrupts pending waitNext() calls
      */
-    void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+    void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex, !m_backend_mutex);
 
     /**
      * Tear down of the template provider thread and any other necessary tear down.
@@ -201,6 +218,11 @@ private:
      * account, we set future_template to false and don't send SetNewPrevHash.
      */
     [[nodiscard]] bool SendWork(Sv2Client& client, uint64_t template_id, BlockTemplate& block_template, bool future_template);
+
+    /**
+     * Interrupt template waits on the active backend session.
+     */
+    void InterruptBackend() EXCLUSIVE_LOCKS_REQUIRED(!m_backend_mutex, !m_tp_mutex);
 
 };
 
