@@ -23,7 +23,9 @@
 // Allow a few seconds for clients to submit a block or to request transactions
 constexpr size_t STALE_TEMPLATE_GRACE_PERIOD{10};
 
-Sv2TemplateProvider::Sv2TemplateProvider(interfaces::Mining& mining) : m_mining{mining}
+Sv2TemplateProvider::Sv2TemplateProvider(std::unique_ptr<interfaces::Init> node_init,
+                                         std::unique_ptr<interfaces::Mining> mining)
+    : m_backend{std::make_shared<BackendSession>(std::move(node_init), std::move(mining))}
 {
     // TODO: persist static key
     CKey static_key;
@@ -141,7 +143,7 @@ void Sv2TemplateProvider::Interrupt()
         }
     }
 
-    m_mining.interrupt();
+    m_backend->Mining().interrupt();
     // Also interrupt network threads so client handlers can wind down quickly.
     if (m_connman) m_connman->Interrupt();
 }
@@ -192,7 +194,7 @@ void Sv2TemplateProvider::ThreadSv2Handler()
         // TODO: Wait until there's no headers-only branch with more work than our chaintip.
         //       The current check can still cause us to broadcast a few dozen useless templates
         //       at startup.
-        if (!m_mining.isInitialBlockDownload()) break;
+        if (!m_backend->Mining().isInitialBlockDownload()) break;
         if (log_ibd == 0) {
             LogPrintf("Waiting for IBD to complete on %s network before serving templates (this may take a while)\n",
                       ChainTypeToString(gArgs.GetChainType()));
@@ -275,6 +277,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
         };
 
         std::shared_ptr<BlockTemplate> block_template;
+        const std::shared_ptr<BackendSession> backend{m_backend};
         // Cache most recent block_template->getBlockHeader().hashPrevBlock result.
         uint256 prev_hash;
 
@@ -295,7 +298,7 @@ void Sv2TemplateProvider::ThreadSv2ClientHandler(size_t client_id)
                 if (!prepare_block_create_options(block_create_options)) break;
 
                 const auto time_start{SteadyClock::now()};
-                block_template = m_mining.createNewBlock(block_create_options);
+                block_template = backend->Mining().createNewBlock(block_create_options);
                 if (!block_template) {
                     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "No new template for client id=%zu, node is shutting down\n",
                         client_id);

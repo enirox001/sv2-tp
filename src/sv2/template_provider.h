@@ -2,6 +2,7 @@
 #define BITCOIN_SV2_TEMPLATE_PROVIDER_H
 
 #include <chrono>
+#include <interfaces/init.h>
 #include <interfaces/mining.h>
 #include <sv2/connman.h>
 #include <sv2/messages.h>
@@ -11,6 +12,7 @@
 #include <util/time.h>
 #include <streams.h>
 #include <memory>
+#include <atomic>
 
 using interfaces::BlockTemplate;
 
@@ -52,11 +54,18 @@ class Sv2TemplateProvider : public Sv2EventsInterface
 {
 
 private:
-    /**
-    * The Mining interface is used to build new valid blocks, get the best known
-    * block hash and to check whether the node is still in IBD.
-    */
-    interfaces::Mining& m_mining;
+    /** Owns the interfaces associated with one IPC connection generation. */
+    struct BackendSession {
+        BackendSession(std::unique_ptr<interfaces::Init> init, std::unique_ptr<interfaces::Mining> mining) :
+            m_init(std::move(init)), m_mining(std::move(mining)) {}
+
+        interfaces::Mining& Mining() { return *m_mining; }
+
+    private:
+        // Keep init alive for as long as proxies from this generation may be used.
+        std::unique_ptr<interfaces::Init> m_init;
+        std::unique_ptr<interfaces::Mining> m_mining;
+    };
 
     /*
      * The template provider subprotocol used in setup connection messages. The stratum v2
@@ -88,6 +97,9 @@ private:
     std::atomic<bool> m_flag_interrupt_sv2{false};
     CThreadInterrupt m_interrupt_sv2;
 
+    /** The Bitcoin Core IPC connection and its associated interfaces. */
+    std::shared_ptr<BackendSession> m_backend;
+
     /**
      * The most recent template id. This is incremented on creating new template,
      * which happens for each connected client.
@@ -112,7 +124,8 @@ private:
     BlockTemplateCache m_block_template_cache GUARDED_BY(m_tp_mutex);
 
 public:
-    explicit Sv2TemplateProvider(interfaces::Mining& mining);
+    Sv2TemplateProvider(std::unique_ptr<interfaces::Init> node_init,
+                        std::unique_ptr<interfaces::Mining> mining);
 
     ~Sv2TemplateProvider() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
 
