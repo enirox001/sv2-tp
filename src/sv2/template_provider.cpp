@@ -131,7 +131,7 @@ void Sv2TemplateProvider::Interrupt()
 {
     AssertLockNotHeld(m_tp_mutex);
 
-    m_flag_interrupt_sv2 = true;
+    if (m_flag_interrupt_sv2.exchange(true)) return;
 
     LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Interrupt pending mining waits...");
     {

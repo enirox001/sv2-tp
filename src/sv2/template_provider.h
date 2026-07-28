@@ -144,7 +144,8 @@ public:
 
     /**
      * Triggered on interrupt signals to stop the main event loop in ThreadSv2Handler().
-     * Interrupts pending waitNext() calls
+     * Interrupts pending waitNext() calls.
+     * Safe to call more than once.
      */
     void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
 
