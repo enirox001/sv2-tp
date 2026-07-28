@@ -80,6 +80,28 @@ stop_pid()
     fi
 }
 
+# Wait up to the given timeout for a process to exit, then kill it.
+# Return the process exit status.
+wait_for_exit_or_kill()
+{
+    local pid="$1"
+    local timeout="$2"
+    local status=0
+
+    # SIGKILL ensures a timeout cannot be mistaken for a clean exit.
+    (
+        sleep "${timeout}"
+        kill -KILL "${pid}" 2>/dev/null || true
+    ) &
+    local watchdog_pid="$!"
+
+    wait "${pid}" || status="$?"
+    kill "${watchdog_pid}" 2>/dev/null || true
+    wait "${watchdog_pid}" 2>/dev/null || true
+
+    return "${status}"
+}
+
 show_logs()
 {
     (
@@ -338,6 +360,11 @@ run_phase()
         exit 1
     fi
 
+    # Freeze the mined block range and allow delayed saves to finish.
+    stop_pid "${MINER_PID}"
+    MINER_PID=""
+    sleep 2
+
     grep -q "Connected to bitcoin-node via IPC" "${LOG_DIR}/sv2-tp.log"
 
     echo "Verifying BIP54 compliance of SRI-mined blocks (heights 18..${count})"
@@ -352,6 +379,28 @@ run_phase()
         exit 1
     fi
 
+    # Exercise backend disconnect detection without an SV2 client.
+    stop_pid "${POOL_PID}"
+    POOL_PID=""
+
+    echo "Stopping the Bitcoin Core backend to test IPC disconnect handling"
+    "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" stop >/dev/null
+
+    sv2_tp_status=0
+    wait_for_exit_or_kill "${SV2_TP_PID}" 30 || sv2_tp_status="$?"
+    SV2_TP_PID=""
+
+    if (( sv2_tp_status != 0 )); then
+        echo "sv2-tp did not exit cleanly after Bitcoin Core disconnected (status=${sv2_tp_status})" >&2
+        exit 1
+    fi
+
+    if ! grep -q "Mining backend IPC connection lost" "${LOG_DIR}/sv2-tp.log"; then
+        echo "sv2-tp did not log the mining backend IPC disconnect" >&2
+        exit 1
+    fi
+
+    echo "sv2-tp detected the mining backend IPC disconnect and exited cleanly"
     echo "SRI integration test completed successfully at regtest height ${count}"
 }
 
