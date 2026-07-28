@@ -127,21 +127,40 @@ Sv2TemplateProvider::~Sv2TemplateProvider()
     StopThreads();
 }
 
+void Sv2TemplateProvider::BackendDisconnected()
+{
+    m_backend_connected = false;
+    Interrupt();
+}
+
 void Sv2TemplateProvider::Interrupt()
 {
     AssertLockNotHeld(m_tp_mutex);
 
     if (m_flag_interrupt_sv2.exchange(true)) return;
 
-    LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Interrupt pending mining waits...");
-    {
-        LOCK(m_tp_mutex);
-        for (auto& t : GetBlockTemplates()) {
-            t.second.second->interruptWait();
+    if (m_backend_connected) {
+        LogPrintLevel(BCLog::SV2, BCLog::Level::Trace, "Interrupt pending mining waits...");
+        try {
+            LOCK(m_tp_mutex);
+            for (auto& t : GetBlockTemplates()) {
+                t.second.second->interruptWait();
+            }
+        } catch (const ipc::Exception& e) {
+            LogPrintf("Unable to interrupt block-template wait: %s\n", e.what());
+            m_backend_connected = false;
         }
     }
 
-    m_mining.interrupt();
+    // interruptWait() may be the first call to discover a backend disconnect.
+    if (m_backend_connected) {
+        try {
+            m_mining.interrupt();
+        } catch (const ipc::Exception& e) {
+            LogPrintf("Unable to interrupt mining IPC: %s\n", e.what());
+        }
+    }
+
     // Also interrupt network threads so client handlers can wind down quickly.
     if (m_connman) m_connman->Interrupt();
 }
@@ -192,7 +211,12 @@ void Sv2TemplateProvider::ThreadSv2Handler()
         // TODO: Wait until there's no headers-only branch with more work than our chaintip.
         //       The current check can still cause us to broadcast a few dozen useless templates
         //       at startup.
-        if (!m_mining.isInitialBlockDownload()) break;
+        try {
+            if (!m_mining.isInitialBlockDownload()) break;
+        } catch (const ipc::Exception& e) {
+            LogPrintf("Unable to check initial block download %s\n", e.what());
+            return;
+        }
         if (log_ibd == 0) {
             LogPrintf("Waiting for IBD to complete on %s network before serving templates (this may take a while)\n",
                       ChainTypeToString(gArgs.GetChainType()));
