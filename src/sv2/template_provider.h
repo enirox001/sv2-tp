@@ -87,6 +87,7 @@ private:
      */
     std::atomic<bool> m_flag_interrupt_sv2{false};
     CThreadInterrupt m_interrupt_sv2;
+    std::atomic<bool> m_backend_connected{true};
 
     /**
      * The most recent template id. This is incremented on creating new template,
@@ -144,9 +145,13 @@ public:
 
     /**
      * Triggered on interrupt signals to stop the main event loop in ThreadSv2Handler().
-     * Interrupts pending waitNext() calls
+     * Interrupts pending waitNext() calls.
+     * Safe to call more than once.
      */
     void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
+
+    /** Mark the backend disconnected and interrupt without making more backend calls. */
+    void BackendDisconnected() EXCLUSIVE_LOCKS_REQUIRED(!m_tp_mutex);
 
     /**
      * Tear down of the template provider thread and any other necessary tear down.

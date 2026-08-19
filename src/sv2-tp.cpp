@@ -13,6 +13,7 @@
 #include <init/common.h>
 #include <interfaces/init.h>
 #include <interfaces/ipc.h>
+#include <ipc/exception.h>
 #include <logging.h>
 #include <sv2/template_provider.h>
 #include <tinyformat.h>
@@ -298,8 +299,17 @@ MAIN_FUNCTION
     registerSignalHandler(SIGINT, HandleSIGTERM);
 #endif
 
-    while(!g_interrupt) {
-        UninterruptibleSleep(100ms);
+    // Probe the mining IPC connection even when no SV2 clients are connected,
+    // so a backend disconnect triggers shutdown.
+    while (!g_interrupt) {
+        try {
+            mining->isInitialBlockDownload();
+        } catch (const ipc::Exception& e) {
+            LogPrintf("Mining backend IPC connection lost: %s\n", e.what());
+            tp->BackendDisconnected();
+            break;
+        }
+        UninterruptibleSleep(1s);
     }
 
     tp->Interrupt();
