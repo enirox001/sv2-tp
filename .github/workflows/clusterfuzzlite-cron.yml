@@ -24,7 +24,8 @@ jobs:
     with:
       job_name: Corpus prune
       run_mode: prune
-      fuzz_seconds: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.fuzz_seconds != '' && fromJSON(github.event.inputs.fuzz_seconds) || 600 }}
+      # The budget is divided between all fuzz targets, including slow sanitizer builds.
+      fuzz_seconds: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.fuzz_seconds != '' && fromJSON(github.event.inputs.fuzz_seconds) || 7200 }}
       output_sarif: true
   coverage:
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.job == '' || github.event.inputs.job == 'both' || github.event.inputs.job == 'coverage' }}
