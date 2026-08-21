@@ -55,36 +55,47 @@ jobs:
       - name: Build sv2-apps
         run: ./ci/test/04_run_stratum_v2_scenario.sh build-sv2-apps
 
-      - name: Run SRI integration test
-        run: ./ci/test/04_run_stratum_v2_scenario.sh run
+      - name: Run end-to-end mining test
+        env:
+          RUNTIME_ROOT: ${{ github.workspace }}/sri-integration-test/mining
+        run: ./ci/test/04_run_stratum_v2_scenario.sh run-mining
+
+      - name: Run mining backend disconnect test
+        env:
+          RUNTIME_ROOT: ${{ github.workspace }}/sri-integration-test/backend-disconnect
+        run: ./ci/test/04_run_stratum_v2_scenario.sh run-backend-disconnect
 
       - name: 'Result: Bitcoin Core'
         if: always()
         run: |
-          echo '::group::bitcoin debug.log'
-          cat "${SCENARIO_ROOT}/datadir/regtest/debug.log" || true
-          echo '::endgroup::'
+          for scenario in mining backend-disconnect; do
+            echo "::group::${scenario} bitcoin debug.log"
+            cat "${SCENARIO_ROOT}/${scenario}/datadir/regtest/debug.log" || true
+            echo '::endgroup::'
+          done
 
       - name: 'Result: sv2-tp'
         if: always()
         run: |
-          echo '::group::sv2-tp stdout/stderr'
-          cat "${SCENARIO_ROOT}/logs/sv2-tp.log" || true
-          echo '::endgroup::'
-          echo '::group::sv2-tp debug log'
-          cat "${SCENARIO_ROOT}/datadir/regtest/sv2-debug.log" || true
-          echo '::endgroup::'
+          for scenario in mining backend-disconnect; do
+            echo "::group::${scenario} sv2-tp stdout/stderr"
+            cat "${SCENARIO_ROOT}/${scenario}/logs/sv2-tp.log" || true
+            echo '::endgroup::'
+            echo "::group::${scenario} sv2-tp debug log"
+            cat "${SCENARIO_ROOT}/${scenario}/datadir/regtest/sv2-debug.log" || true
+            echo '::endgroup::'
+          done
 
       - name: 'Result: pool_sv2'
         if: always()
         run: |
           echo '::group::pool_sv2 log'
-          cat "${SCENARIO_ROOT}/logs/pool.log" || true
+          cat "${SCENARIO_ROOT}/mining/logs/pool.log" || true
           echo '::endgroup::'
 
       - name: 'Result: mining_device'
         if: always()
         run: |
           echo '::group::mining_device log'
-          cat "${SCENARIO_ROOT}/logs/mining-device.log" || true
+          cat "${SCENARIO_ROOT}/mining/logs/mining-device.log" || true
           echo '::endgroup::'

@@ -15,6 +15,7 @@ readonly BITCOIN_CORE_REF="${BITCOIN_CORE_REF:-}"
 readonly SV2_APPS_REPO="${SV2_APPS_REPO:-https://github.com/stratum-mining/sv2-apps.git}"
 readonly SV2_APPS_REF="${SV2_APPS_REF:-main}"
 readonly SCENARIO_ROOT="${SCENARIO_ROOT:-${REPO_ROOT}/sri-integration-test}"
+readonly RUNTIME_ROOT="${RUNTIME_ROOT:-${SCENARIO_ROOT}}"
 readonly MODE="${1:-all}"
 
 if [[ -z "${BITCOIN_CORE_REF}" ]]; then
@@ -47,9 +48,9 @@ readonly DOWNLOADS_DIR="${SCENARIO_ROOT}/downloads"
 readonly BITCOIN_CORE_SOURCE_DIR="${SCENARIO_ROOT}/bitcoin-core-source"
 readonly BITCOIN_CORE_BUILD_DIR="${SCENARIO_ROOT}/bitcoin-core-build"
 readonly SV2_APPS_DIR="${SCENARIO_ROOT}/sv2-apps"
-readonly DATADIR="${SCENARIO_ROOT}/datadir"
-readonly LOG_DIR="${SCENARIO_ROOT}/logs"
-readonly POOL_CONFIG="${SCENARIO_ROOT}/pool-regtest.toml"
+readonly DATADIR="${RUNTIME_ROOT}/datadir"
+readonly LOG_DIR="${RUNTIME_ROOT}/logs"
+readonly POOL_CONFIG="${RUNTIME_ROOT}/pool-regtest.toml"
 readonly BITCOIN_CONFIG_SOURCE="${REPO_ROOT}/ci/test/stratum_v2_bitcoin.conf"
 readonly SV2_TP_CONFIG_SOURCE="${REPO_ROOT}/ci/test/stratum_v2_sv2-tp.conf"
 readonly POOL_CONFIG_TEMPLATE="${REPO_ROOT}/ci/test/stratum_v2_pool-regtest.toml.in"
@@ -78,6 +79,30 @@ stop_pid()
         kill "${pid}" 2>/dev/null || true
         wait "${pid}" 2>/dev/null || true
     fi
+}
+
+wait_for_log()
+{
+    local pid="$1"
+    local log="$2"
+    local pattern="$3"
+    local timeout="$4"
+    local description="$5"
+    local i
+
+    for ((i = 0; i < timeout; ++i)); do
+        if grep -q "${pattern}" "${log}" 2>/dev/null; then
+            return 0
+        fi
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            echo "${description} exited before becoming ready" >&2
+            return 1
+        fi
+        sleep 1
+    done
+
+    echo "Timed out waiting for ${description}" >&2
+    return 1
 }
 
 # Wait up to the given timeout for a process to exit, then kill it.
@@ -122,11 +147,12 @@ show_logs()
 
 cleanup()
 {
-    set +e
-
     stop_pid "${MINER_PID}"
+    MINER_PID=""
     stop_pid "${POOL_PID}"
+    POOL_PID=""
     stop_pid "${SV2_TP_PID}"
+    SV2_TP_PID=""
 
     if [[ -x "${BITCOIN_CLI}" ]]; then
         "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" stop >/dev/null 2>&1 || true
@@ -166,6 +192,7 @@ print(tx["locktime"], tx["vin"][0]["sequence"])
 
 prepare_runtime_state()
 {
+    mkdir -p "${RUNTIME_ROOT}"
     rm -rf "${DATADIR}" "${LOG_DIR}"
     rm -f "${POOL_CONFIG}"
     mkdir -p "${DATADIR}" "${LOG_DIR}"
@@ -284,10 +311,11 @@ build_sv2_apps_phase()
     build_mining_device
 }
 
-assert_run_prereqs()
+assert_executables()
 {
     local missing=0
-    for path in "${BITCOIN}" "${BITCOIN_CLI}" "${SV2_TP}" "${POOL_SV2}" "${MINING_DEVICE}"; do
+    local path
+    for path in "$@"; do
         if [[ ! -x "${path}" ]]; then
             echo "Missing executable for run mode: ${path}" >&2
             missing=1
@@ -299,15 +327,26 @@ assert_run_prereqs()
     fi
 }
 
-run_phase()
+start_bitcoin_core()
 {
-    echo "Preparing SRI integration test runtime state"
-    prepare_runtime_state
-    assert_run_prereqs
-
     echo "Starting Bitcoin Core"
     "${BITCOIN}" -m node "${BITCOIN_ARGS[@]}" -daemonwait
     "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" -rpcwait getblockcount >/dev/null
+}
+
+start_sv2_tp()
+{
+    echo "Starting sv2-tp"
+    "${SV2_TP}" -datadir="${DATADIR}" > "${LOG_DIR}/sv2-tp.log" 2>&1 &
+    SV2_TP_PID="$!"
+
+    wait_for_log "${SV2_TP_PID}" "${LOG_DIR}/sv2-tp.log" \
+        "Connected to bitcoin-node via IPC" 60 "sv2-tp IPC connection"
+}
+
+prepare_mining_state()
+{
+    local count addr reward_addr
 
     echo "Preparing regtest wallet"
     "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" createwallet miner >/dev/null
@@ -321,29 +360,39 @@ run_phase()
 
     reward_addr="$("${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" -rpcwallet=miner getnewaddress)"
     sed "s/REPLACE_WITH_REGTEST_ADDRESS/${reward_addr}/" "${POOL_CONFIG_TEMPLATE}" > "${POOL_CONFIG}"
+}
 
-    echo "Starting sv2-tp"
-    "${SV2_TP}" -datadir="${DATADIR}" > "${LOG_DIR}/sv2-tp.log" 2>&1 &
-    SV2_TP_PID="$!"
-
-    for ((i = 0; i < 60; ++i)); do
-        if grep -q "Connected to bitcoin-node via IPC" "${LOG_DIR}/sv2-tp.log" 2>/dev/null; then
-            break
-        fi
-        sleep 1
-    done
-
+start_pool()
+{
     echo "Starting pool_sv2"
     RUST_LOG=debug "${POOL_SV2}" -c "${POOL_CONFIG}" > "${LOG_DIR}/pool.log" 2>&1 &
     POOL_PID="$!"
 
     sleep 5
+}
 
+start_mining_device()
+{
     echo "Starting mining_device"
     RUST_LOG=debug "${MINING_DEVICE}" --address-pool 127.0.0.1:33333 \
         --nominal-hashrate-multiplier 0.01 --cores 1 \
         > "${LOG_DIR}/mining-device.log" 2>&1 &
     MINER_PID="$!"
+}
+
+run_mining()
+{
+    local count bip54_passed h i
+
+    echo "Preparing end-to-end mining scenario"
+    prepare_runtime_state
+    assert_executables "${BITCOIN}" "${BITCOIN_CLI}" "${SV2_TP}" "${POOL_SV2}" "${MINING_DEVICE}"
+
+    start_bitcoin_core
+    prepare_mining_state
+    start_sv2_tp
+    start_pool
+    start_mining_device
 
     echo "Waiting for a mined block"
     for ((i = 0; i < 180; ++i)); do
@@ -379,14 +428,25 @@ run_phase()
         exit 1
     fi
 
+    echo "End-to-end mining scenario completed successfully at regtest height ${count}"
+    cleanup
+}
+
+run_backend_disconnect()
+{
+    local sv2_tp_status=0
+
+    echo "Preparing mining backend disconnect scenario"
+    prepare_runtime_state
+    assert_executables "${BITCOIN}" "${BITCOIN_CLI}" "${SV2_TP}"
+
     # Exercise backend disconnect detection without an SV2 client.
-    stop_pid "${POOL_PID}"
-    POOL_PID=""
+    start_bitcoin_core
+    start_sv2_tp
 
     echo "Stopping the Bitcoin Core backend to test IPC disconnect handling"
     "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" stop >/dev/null
 
-    sv2_tp_status=0
     wait_for_exit_or_kill "${SV2_TP_PID}" 30 || sv2_tp_status="$?"
     SV2_TP_PID=""
 
@@ -401,7 +461,13 @@ run_phase()
     fi
 
     echo "sv2-tp detected the mining backend IPC disconnect and exited cleanly"
-    echo "SRI integration test completed successfully at regtest height ${count}"
+    cleanup
+}
+
+run_all()
+{
+    run_mining
+    run_backend_disconnect
 }
 
 trap cleanup EXIT
@@ -412,7 +478,7 @@ case "${MODE}" in
         build_bitcoin_core_phase
         build_sv2_tp_phase
         build_sv2_apps_phase
-        run_phase
+        run_all
         ;;
     build)
         build_phase
@@ -427,10 +493,16 @@ case "${MODE}" in
         build_sv2_apps_phase
         ;;
     run)
-        run_phase
+        run_all
+        ;;
+    run-mining)
+        run_mining
+        ;;
+    run-backend-disconnect)
+        run_backend_disconnect
         ;;
     *)
-        echo "Usage: $0 [all|build|build-bitcoin-core|build-sv2-tp|build-sv2-apps|run]" >&2
+        echo "Usage: $0 [all|build|build-bitcoin-core|build-sv2-tp|build-sv2-apps|run|run-mining|run-backend-disconnect]" >&2
         exit 1
         ;;
 esac
