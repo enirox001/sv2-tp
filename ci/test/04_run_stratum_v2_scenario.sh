@@ -51,6 +51,7 @@ readonly SV2_APPS_DIR="${SCENARIO_ROOT}/sv2-apps"
 readonly DATADIR="${RUNTIME_ROOT}/datadir"
 readonly LOG_DIR="${RUNTIME_ROOT}/logs"
 readonly POOL_CONFIG="${RUNTIME_ROOT}/pool-regtest.toml"
+readonly BITCOIN_PID_FILE="${RUNTIME_ROOT}/bitcoin-node.pid"
 readonly BITCOIN_CONFIG_SOURCE="${REPO_ROOT}/ci/test/stratum_v2_bitcoin.conf"
 readonly SV2_TP_CONFIG_SOURCE="${REPO_ROOT}/ci/test/stratum_v2_sv2-tp.conf"
 readonly POOL_CONFIG_TEMPLATE="${REPO_ROOT}/ci/test/stratum_v2_pool-regtest.toml.in"
@@ -71,6 +72,7 @@ readonly -a BITCOIN_ARGS=("-datadir=${DATADIR}")
 SV2_TP_PID=""
 POOL_PID=""
 MINER_PID=""
+BITCOIN_PID=""
 
 stop_pid()
 {
@@ -79,6 +81,31 @@ stop_pid()
         kill "${pid}" 2>/dev/null || true
         wait "${pid}" 2>/dev/null || true
     fi
+}
+
+stop_bitcoin_core()
+{
+    local i
+
+    if [[ -z "${BITCOIN_PID}" ]]; then
+        return
+    fi
+
+    if kill -0 "${BITCOIN_PID}" 2>/dev/null; then
+        "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" stop >/dev/null 2>&1 || true
+    fi
+
+    for ((i = 0; i < 60; ++i)); do
+        if ! kill -0 "${BITCOIN_PID}" 2>/dev/null; then
+            BITCOIN_PID=""
+            rm -f "${BITCOIN_PID_FILE}"
+            return
+        fi
+        sleep 1
+    done
+
+    echo "Bitcoin Core did not stop within 60 seconds" >&2
+    return 1
 }
 
 wait_for_log()
@@ -154,9 +181,7 @@ cleanup()
     stop_pid "${SV2_TP_PID}"
     SV2_TP_PID=""
 
-    if [[ -x "${BITCOIN_CLI}" ]]; then
-        "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" stop >/dev/null 2>&1 || true
-    fi
+    stop_bitcoin_core
 }
 
 # Verify a single block's coinbase satisfies BIP54 (Consensus Cleanup):
@@ -194,7 +219,7 @@ prepare_runtime_state()
 {
     mkdir -p "${RUNTIME_ROOT}"
     rm -rf "${DATADIR}" "${LOG_DIR}"
-    rm -f "${POOL_CONFIG}"
+    rm -f "${POOL_CONFIG}" "${BITCOIN_PID_FILE}"
     mkdir -p "${DATADIR}" "${LOG_DIR}"
     install -m 0644 "${BITCOIN_CONFIG_SOURCE}" "${DATADIR}/bitcoin.conf"
     install -m 0644 "${SV2_TP_CONFIG_SOURCE}" "${DATADIR}/sv2-tp.conf"
@@ -330,7 +355,17 @@ assert_executables()
 start_bitcoin_core()
 {
     echo "Starting Bitcoin Core"
-    "${BITCOIN}" -m node "${BITCOIN_ARGS[@]}" -daemonwait
+    "${BITCOIN}" -m node "${BITCOIN_ARGS[@]}" -pid="${BITCOIN_PID_FILE}" -daemonwait
+    if [[ ! -f "${BITCOIN_PID_FILE}" ]]; then
+        echo "Bitcoin Core did not create its PID file" >&2
+        return 1
+    fi
+    BITCOIN_PID="$(<"${BITCOIN_PID_FILE}")"
+    if [[ ! "${BITCOIN_PID}" =~ ^[0-9]+$ ]] || ! kill -0 "${BITCOIN_PID}" 2>/dev/null; then
+        echo "Bitcoin Core PID file does not identify a running process" >&2
+        BITCOIN_PID=""
+        return 1
+    fi
     "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" -rpcwait getblockcount >/dev/null
 }
 
@@ -445,7 +480,7 @@ run_backend_disconnect()
     start_sv2_tp
 
     echo "Stopping the Bitcoin Core backend to test IPC disconnect handling"
-    "${BITCOIN_CLI}" "${BITCOIN_ARGS[@]}" stop >/dev/null
+    stop_bitcoin_core
 
     wait_for_exit_or_kill "${SV2_TP_PID}" 30 || sv2_tp_status="$?"
     SV2_TP_PID=""
